@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: food-delivery-app
+    env: python
+    buildCommand: ""
+    startCommand: gunicorn app1:app
+    plan: free
+    autoDeploy: true
