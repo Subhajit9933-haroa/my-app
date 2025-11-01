@@ -1,1377 +1,890 @@
-from flask import Flask, render_template_string, request, redirect, url_for, session, send_file
-import os, json
-from openpyxl import Workbook
-from datetime import datetime
+import os
+import json
+import socket
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, send_file
 from werkzeug.utils import secure_filename
-import time
+from flask_sqlalchemy import SQLAlchemy
+from flask_socketio import SocketIO, emit
+from jinja2 import DictLoader
+from datetime import datetime
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from io import BytesIO
 
+# ==============================================================================
+#  основных настроек (App Configuration)
+# ==============================================================================
+
+UPLOAD_FOLDER = 'uploads'
 app = Flask(__name__)
-# IMPORTANT: In real-world applications, store this key in an environment variable.
-app.secret_key = "fooddeliverysecretkey_subhajit" 
 
-# -------------------- CONFIGURATION --------------------
-DELIVERY_CHARGE = 20 
-DEFAULT_RINGTONE = "data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4LjI5LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAUAAAiSAAODg4ODg4ODg4ODh4eHh4eHh4eHh4uLi4uLi4uLi4uPj4+Pj4+Pj4+Pj5OTk5OTk5OTk5OXl5eXl5eXl5eXm5ubm5ubm5ubm5+fn5+fn5+fn5+jo6Ojo6Ojo6Ojp6enp6enp6enp6urq6urq6urq6uvr6+vr6+vr6+vr7Ozs7Ozs7Ozs7O3t7e3t7e3t7e3u7u7u7u7u7u7u7+/v7+/v7+/v7+//8AAAAATGF2YzU4LjU0AAAAAAAAAAAAAAAAJAAAAAAAAAAAIkgPYLiYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV"
+# Use environment variables for configuration
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'a-default-fallback-secret-key-for-dev')
+# Render provides a DATABASE_URL for PostgreSQL. Fallback to SQLite for local dev.
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///foodify.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-os.makedirs("data", exist_ok=True)
-os.makedirs("static/uploads", exist_ok=True)
+db = SQLAlchemy(app)
+socketio = SocketIO(app, async_mode='eventlet')
 
-PRODUCT_FILE = "data/products.json"
-ORDER_FILE = "data/orders.json"
-CONFIG_FILE = "data/config.json"
-# Updated Default Logo with FOODIFY Theme
-DEFAULT_LOGO = "https://placehold.co/150x40/4CAF50/ffffff?text=FOODIFY"
+# Admin credentials from environment variables
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'SUBHAJIT')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '8167')
 
-# Create files if they don't exist
-if not os.path.exists(PRODUCT_FILE):
-    default_products = [{
-        "name": "Classic Burger",
-        "price": 250,
-        "quantity": 10,
-        "image": "https://placehold.co/160x120/4CAF50/ffffff?text=Burger"
-    }]
-    with open(PRODUCT_FILE, "w") as f:
-        json.dump(default_products, f, indent=2)
-        
-if not os.path.exists(ORDER_FILE):
-    with open(ORDER_FILE, "w") as f:
-        json.dump([], f, indent=2)
+# ==============================================================================
+# Модели базы данных (Database Models)
+# ==============================================================================
 
-if not os.path.exists(CONFIG_FILE):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump({
-            "logo_url": DEFAULT_LOGO,
-            "notification_sound": "/static/default_notification.mp3"  # Update this path
-        }, f, indent=2)
+class Food(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False, unique=True)
+    price = db.Column(db.Float, nullable=False)
+    image_url = db.Column(db.String(255), nullable=False)
 
-# -------------------- HELPER FUNCTIONS --------------------
-def load_json(path):
-    """Loads data from a JSON file, handling empty/missing files."""
-    try:
-        with open(path, 'r') as f: 
-            # Check if the file is empty before attempting to load
-            content = f.read()
-            if not content:
-                print(f"Warning: {path} is empty. Returning empty list.")
-                return []
-            f.seek(0) # Reset file pointer to the beginning
-            return json.loads(content)
-    except FileNotFoundError:
-        return []
-    except json.JSONDecodeError:
-        # If file exists but is corrupted JSON (e.g., 'Expecting value')
-        print(f"Error: {path} contains corrupted JSON. Returning empty list.")
-        return []
+class Order(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    customer_name = db.Column(db.String(100), nullable=False)
+    customer_phone = db.Column(db.String(20), nullable=False)
+    customer_address = db.Column(db.String(255), nullable=False)
+    total_bill = db.Column(db.Float, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    items = db.relationship('OrderItem', backref='order', lazy=True, cascade="all, delete-orphan")
 
-def save_json(path, data):
-    """Saves data to a JSON file."""
-    with open(path, "w") as f: 
-        json.dump(data, f, indent=2) # Ensure 'f' is passed to json.dump
+class OrderItem(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=False)
+    food_name = db.Column(db.String(100), nullable=False)
+    quantity = db.Column(db.Integer, nullable=False)
+    price = db.Column(db.Float, nullable=False)
 
-def load_config():
-    """Loads configuration data."""
-    try:
-        with open(CONFIG_FILE) as f: 
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"logo_url": DEFAULT_LOGO}
+class AppSetting(db.Model):
+    key = db.Column(db.String(50), primary_key=True)
+    value = db.Column(db.String(255), nullable=True)
 
-def save_config(config_data):
-    """Saves configuration data."""
-    with open(CONFIG_FILE, "w") as f: 
-        json.dump(config_data, f, indent=2)
+# ==============================================================================
+# HTML и CSS шаблоны (HTML & CSS Templates)
+# ==============================================================================
 
-def get_order_by_id(order_id):
-    """Finds an order by its ID."""
-    orders = load_json(ORDER_FILE)
-    return next((o for o in orders if o["id"] == order_id), None)
-
-# -------------------- HTML TEMPLATES (All in English) --------------------
-
-# ১. HOME PAGE TEMPLATE
-home_html = """
+# --- Base Template with Header, Footer, and Styling ---
+BASE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FOODIFY</title>
-<link href='https://fonts.googleapis.com/css?family=Poppins' rel='stylesheet'>
-<style>
-/* Green Theme Colors */
-:root {
-    --primary-color: #4CAF50; /* Green 500 */
-    --primary-dark: #388E3C; /* Green 700 */
-    --light-accent: #E8F5E9; /* Green 50 */
-    --red-alert: #F44336;
-}
-body { font-family:'Poppins',sans-serif;margin:0;background:#f8f8f8;color:#333; }
-header { 
-    background:var(--primary-color);
-    color:white;
-    padding:15px;
-    text-align:center;
-    font-size:24px;
-    font-weight:bold;
-    box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    min-height: 60px;
-}
-header img { 
-    height: 40px; 
-    vertical-align: middle; 
-    border-radius: 4px;
-    max-width: 90%;
-}
-.nav { 
-    display: flex;
-    justify-content: flex-end;
-    align-items: center;
-    padding: 10px 20px;
-    background:white;
-    box-shadow:0 2px 4px rgba(0,0,0,0.05); 
-}
-.nav a { 
-    color:var(--primary-color);
-    font-weight:600;
-    text-decoration:none;
-    padding:5px 10px;
-    border-radius:5px;
-    transition: background 0.2s; 
-    margin-right: 15px;
-}
-.nav a:hover { background: var(--light-accent); }
-.container { padding:20px;text-align:center; }
-.product-grid { display:flex;flex-wrap:wrap;gap:20px;justify-content:center; }
-.product-card { 
-    background:white;
-    box-shadow:0 4px 12px rgba(0,0,0,0.1);
-    border-radius:12px;
-    padding:15px;
-    width:200px;
-    text-align:center;
-    transition:transform 0.3s, box-shadow 0.3s; 
-    overflow:hidden;
-    box-sizing: border-box; 
-}
-.product-card:hover { transform:translateY(-5px);box-shadow:0 8px 16px rgba(0,0,0,0.2); }
-.product-card img { width:100%;height:140px;object-fit:cover;border-radius:8px;margin-bottom:10px;display: block; }
-.product-card h3 { font-size:1.2em;margin:5px 0;color:#333; }
-.product-card p { font-size:1.1em;font-weight:bold;color:var(--primary-color);margin-bottom:10px; }
-
-button { 
-    background:var(--primary-color);
-    border:none;
-    color:white;
-    padding:10px 15px;
-    border-radius:8px;
-    cursor:pointer;
-    font-weight:600;
-    transition:background 0.2s; 
-    width:100%;
-}
-button:hover { background:var(--primary-dark); }
-.cart-btn { background:var(--primary-dark); } /* Use primary dark for contrast */
-
-input[type="number"] { width:60px;padding:5px;border:1px solid #ccc;border-radius:5px;text-align:center;margin-right:5px; }
-.out-of-stock { color:var(--red-alert);font-weight:bold;padding:10px;background:var(--light-accent);border-radius:6px; }
-
-/* Slide Menu CSS */
-.slide-menu {
-    height: 100%;
-    width: 0; 
-    position: fixed;
-    z-index: 100;
-    top: 0;
-    right: 0;
-    background-color: var(--primary-color); 
-    overflow-x: hidden;
-    transition: 0.5s;
-    padding-top: 60px;
-    box-shadow: -5px 0 15px rgba(0,0,0,0.2);
-}
-.slide-menu a {
-    padding: 15px 10px 15px 32px;
-    text-decoration: none;
-    font-size: 1.5em;
-    color: white;
-    display: block;
-    transition: 0.3s;
-    text-align: left;
-    font-weight: 500;
-}
-.slide-menu a:hover {
-    background-color: var(--primary-dark);
-}
-.closebtn {
-    position: absolute;
-    top: 0;
-    right: 25px;
-    font-size: 36px;
-    margin-left: 50px;
-    color: white;
-    text-decoration: none !important;
-}
-.menu-icon {
-    font-size: 30px;
-    cursor: pointer;
-    color: var(--primary-color);
-    padding: 0 10px;
-    line-height: 1;
-}
-
-/* --- Slideshow CSS --- */
-#slideshow-wrapper {
-    max-width: 800px; 
-    margin: 20px auto; 
-    padding: 0; 
-    position: relative;
-}
-#slideshow {
-    background: white; 
-    box-shadow: 0 4px 12px rgba(0,0,0,0.1); 
-    border-radius: 12px; 
-    position: relative; 
-    overflow: hidden; 
-    width: 100%; 
-    padding-top: 56.25%; /* 16:9 Aspect Ratio */
-}
-.slide {
-    transition: opacity 0.6s ease-in-out;
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    opacity: 0;
-    pointer-events: none;
-    border-radius: inherit; 
-}
-.slide.active {
-    opacity: 1;
-    pointer-events: auto;
-}
-.slide img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover; 
-    display: block; 
-    border-radius: inherit; 
-}
-#prev-btn, #next-btn {
-    position: absolute; 
-    top: 50%; 
-    transform: translateY(-50%); 
-    background: rgba(255,255,255,0.7); 
-    border: none; 
-    padding: 10px 15px; 
-    border-radius: 50%; 
-    cursor: pointer; 
-    font-size: 1.2em; 
-    z-index: 20; 
-    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-    transition: background 0.2s;
-    line-height: 1;
-}
-#prev-btn:hover, #next-btn:hover { background: rgba(255,255,255,0.9); }
-#prev-btn { left: 10px; }
-#next-btn { right: 10px; }
-
-#dot-indicators {
-    position: absolute; 
-    bottom: 10px; 
-    left: 0; 
-    right: 0; 
-    display: flex; 
-    justify-content: center; 
-    gap: 8px; 
-    z-index: 20;
-}
-.dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background-color: rgba(255, 255, 255, 0.5);
-    cursor: pointer;
-    transition: background-color 0.3s, transform 0.3s;
-}
-.dot.active-dot {
-    background-color: var(--primary-color);
-    transform: scale(1.2);
-}
-
-@media(max-width:600px){ 
-    .product-card{
-        width:calc(50% - 10px); 
-        padding:10px;
-        margin-bottom: 10px;
-    }
-    .product-grid{gap:20px 10px;} 
-    header{font-size:20px;}
-    .nav{padding:10px;}
-    .nav a{margin-right:10px;}
-    #prev-btn, #next-btn { padding: 8px 12px; font-size: 1em; }
-}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}FOODIFY{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Arial', sans-serif; background-color: #ebe6c7; }
+        .navbar { background-color: #198754; } /* Green */
+        .navbar-brand, .nav-link { color: white !important; }
+        .navbar-brand { font-weight: bold; font-size: 1.5rem; }
+        .card { border: 1px solid #198754; }
+        .card-title { color: #198754; }
+        .btn-primary, .btn-success { background-color: #198754; border-color: #198754; }
+        .btn-primary:hover, .btn-success:hover { background-color: #157347; border-color: #146c43; } /* Darker Green */
+        .notification {
+            position: fixed;
+            top: 80px;
+            right: 20px;
+            background-color: #28a745;
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            z-index: 1050;
+            display: none;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+    </style>
+    {% block head_extra %}{% endblock %}
 </head>
 <body>
-<header>
-    {% if logo_url and logo_url != default_logo %}
-        <img src="{{logo_url}}" alt="Website Logo">
-    {% else %}
-        🍕 FOODIFY
-    {% endif %}
-</header>
-
-<!-- Slide Menu -->
-<div id="mySidenav" class="slide-menu">
-  <a href="javascript:void(0)" class="closebtn" onclick="closeNav()">&times;</a>
-  <a href="{{url_for('cart')}}">🛒 Cart ({{cart_count}})</a>
-  <a href="{{url_for('admin_login')}}">🔑 Admin Login</a>
-</div>
-
-<div class="nav">
-    <a href="{{url_for('cart')}}" style="padding: 0 10px; font-size: 1.1em; background: none; margin-right: 15px;">🛒 Cart ({{cart_count}})</a>
-    <span class="menu-icon" onclick="openNav()">&#9776;</span>
-</div>
-
-<!-- --- Slideshow HTML --- -->
-<div id="slideshow-wrapper">
-    <div id="slideshow">
-        
-        {% for p in products %}
-        <div class="slide{% if loop.index == 1 %} active{% endif %}">
-            <img src="{{p['image']}}" alt="{{p['name']}}" onerror="this.onerror=null;this.src='https://placehold.co/800x450/333333/ffffff?text=Image+Not+Found'">
-        </div>
-        {% endfor %}
-        
-        {% if not products %}
-        <div class="slide active">
-            <img src="https://placehold.co/800x450/333333/ffffff?text=Add+Food+Items+in+Admin+Panel" alt="No Items">
-        </div>
-        {% endif %}
-
-        
-        <!-- Navigation Buttons -->
-        <button id="prev-btn">
-            &#10094;
-        </button>
-        <button id="next-btn">
-            &#10095;
-        </button>
-
-        <!-- Dot Indicators -->
-        <div id="dot-indicators">
-        </div>
-    </div>
-</div>
-<!-- --- Slideshow HTML End --- -->
-
-<div class="container">
-    <div class="product-grid">
-    {% for p in products %}
-    <div class="product-card">
-        <img src="{{p['image']}}" alt="{{p['name']}}" onerror="this.onerror=null;this.src='https://placehold.co/160x120/333333/ffffff?text=Image+Missing'">
-        <h3>{{p['name']}}</h3>
-        <p>₹{{p['price']}}</p>
-        {% if p['quantity'] > 0 %}
-        <form action="/add_to_cart" method="post" style="display:flex; flex-direction:column; gap:5px; align-items:center;">
-            <div style="display:flex; justify-content:center; align-items:center; width:100%;">
-                <label for="qty-{{loop.index}}" style="font-weight:500;">Quantity:</label>
-                <input type="number" name="qty" id="qty-{{loop.index}}" min="1" max="{{p['quantity']}}" value="1" style="flex-grow:1; max-width:80px;">
+    <nav class="navbar navbar-expand-lg">
+        <div class="container">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                {% if settings.logo_url %}
+                    <img src="{{ settings.logo_url }}" alt="Foodify Logo" style="height: 40px;">
+                {% else %}
+                    FOODIFY 🍴
+                {% endif %}
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item"><a class="nav-link" href="{{ url_for('index') }}">Home</a></li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('cart_page') }}">
+                            Cart <span class="badge bg-light text-dark">{{ session.get('cart')|length if session.get('cart') else 0 }}</span>
+                        </a>
+                    </li>
+                    <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_login') }}">Admin</a></li>
+                </ul>
             </div>
-            <input type="hidden" name="name" value="{{p['name']}}">
-            <input type="hidden" name="price" value="{{p['price']}}">
-            <button type="submit">Add to Cart</button>
-        </form>
+        </div>
+    </nav>
+
+    <div class="container mt-4 mb-5">
+        {% block content %}{% endblock %}
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+"""
+
+# --- Homepage Template ---
+HOME_TEMPLATE = """
+{% extends "base.html" %}
+{% block title %}Home - FOODIFY{% endblock %}
+{% block content %}
+    <!-- Carousel Banner -->
+    {% if foods %}
+    <div id="foodCarousel" class="carousel slide mb-5" data-bs-ride="carousel">
+        <div class="carousel-indicators">
+            {% for food in foods %}
+            <button type="button" data-bs-target="#foodCarousel" data-bs-slide-to="{{ loop.index0 }}" class="{{ 'active' if loop.first }}" aria-current="true" aria-label="Slide {{ loop.index }}"></button>
+            {% endfor %}
+        </div>
+        <div class="carousel-inner" style="border-radius: 15px; max-height: 400px;">
+            {% for food in foods %}
+            <div class="carousel-item {{ 'active' if loop.first }}">
+                <img src="{{ food.image_url }}" class="d-block w-100" alt="{{ food.name }}" style="object-fit: cover; height: 400px;">
+                <div class="carousel-caption d-none d-md-block bg-dark bg-opacity-50 p-2 rounded">
+                    <h5>{{ food.name }}</h5>
+                    <p>Only Rs {{ "%.2f"|format(food.price) }}</p>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        <button class="carousel-control-prev" type="button" data-bs-target="#foodCarousel" data-bs-slide="prev">
+            <span class="carousel-control-prev-icon" aria-hidden="true"></span>
+            <span class="visually-hidden">Previous</span>
+        </button>
+        <button class="carousel-control-next" type="button" data-bs-target="#foodCarousel" data-bs-slide="next">
+            <span class="carousel-control-next-icon" aria-hidden="true"></span>
+            <span class="visually-hidden">Next</span>
+        </button>
+    </div>
+    {% endif %}
+    <div class="text-center mb-4">
+        <h1>Welcome to FOODIFY</h1>
+        <p class="lead">The best food, delivered right to your door.</p>
+    </div>
+    <div class="row">
+        {% for food in foods %}
+        <div class="col-md-4 mb-4">
+            <div class="card h-100">
+                <img src="{{ food.image_url }}" class="card-img-top" alt="{{ food.name }}" style="height: 200px; object-fit: cover;">
+                <div class="card-body d-flex flex-column">
+                    <h5 class="card-title">{{ food.name }}</h5>
+                    <p class="card-text">Price: Rs {{ "%.2f"|format(food.price) }}</p>
+                    <form action="{{ url_for('add_to_cart', food_id=food.id) }}" method="post" class="mt-auto">
+                        <div class="input-group">
+                            <input type="number" name="quantity" class="form-control" value="1" min="1">
+                            <button type="submit" class="btn btn-primary">Add to Cart</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
         {% else %}
-        <p class="out-of-stock">Out of Stock</p>
-        {% endif %}
-    </div>
-    {% endfor %}
-    </div>
-</div>
-
-<script>
-function openNav() {
-    var width = window.innerWidth > 600 ? "35%" : "80%";
-    document.getElementById("mySidenav").style.width = width;
-}
-
-function closeNav() {
-    document.getElementById("mySidenav").style.width = "0";
-}
-
-// --- Slideshow JAVASCRIPT ---
-window.onload = function() {
-    const slides = document.querySelectorAll('.slide');
-    const dotContainer = document.getElementById('dot-indicators');
-    const prevBtn = document.getElementById('prev-btn');
-    const nextBtn = document.getElementById('next-btn');
-    let currentSlideIndex = 0;
-    let intervalId = null;
-    const slideDuration = 4000; 
-    
-    if (slides.length === 0) {
-        if(prevBtn) prevBtn.style.display = 'none';
-        if(nextBtn) nextBtn.style.display = 'none';
-        if(dotContainer) dotContainer.style.display = 'none';
-        return; 
-    }
-
-    if (slides.length <= 1) {
-        if(prevBtn) prevBtn.style.display = 'none';
-        if(nextBtn) nextBtn.style.display = 'none';
-    }
-
-
-    function showSlide(index) {
-        if (index >= slides.length) {
-            currentSlideIndex = 0;
-        } else if (index < 0) {
-            currentSlideIndex = slides.length - 1;
-        } else {
-            currentSlideIndex = index;
-        }
-
-        slides.forEach(slide => {
-            slide.classList.remove('active');
-        });
-
-        slides[currentSlideIndex].classList.add('active');
-        updateDots();
-    }
-
-    function nextSlide() {
-        showSlide(currentSlideIndex + 1);
-        resetAutoAdvance();
-    }
-
-    function prevSlide() {
-        showSlide(currentSlideIndex - 1);
-        resetAutoAdvance();
-    }
-
-    function startAutoAdvance() {
-        if (slides.length > 1) {
-            intervalId = setInterval(nextSlide, slideDuration);
-        }
-    }
-
-    function resetAutoAdvance() {
-        clearInterval(intervalId);
-        startAutoAdvance();
-    }
-
-    function createDots() {
-        if (slides.length <= 1) return; 
-
-        slides.forEach((_, index) => {
-            const dot = document.createElement('span');
-            dot.classList.add('dot');
-            dot.dataset.index = index;
-            dot.addEventListener('click', () => {
-                showSlide(index);
-                resetAutoAdvance();
-            });
-            dotContainer.appendChild(dot);
-        });
-    }
-
-    function updateDots() {
-        const dots = dotContainer.querySelectorAll('.dot');
-        dots.forEach((dot, index) => {
-            if (index === currentSlideIndex) {
-                dot.classList.add('active-dot');
-            } else {
-                dot.classList.remove('active-dot');
-            }
-        });
-    }
-
-    // Initialization
-    if (slides.length > 0) {
-        createDots();
-        if (prevBtn && nextBtn) {
-            prevBtn.addEventListener('click', prevSlide);
-            nextBtn.addEventListener('click', nextSlide);
-        }
-        showSlide(0); 
-        startAutoAdvance();
-
-        const slideshowContainer = document.getElementById('slideshow');
-        if (slideshowContainer) {
-            slideshowContainer.addEventListener('mouseenter', () => clearInterval(intervalId));
-            slideshowContainer.addEventListener('mouseleave', resetAutoAdvance);
-        }
-    }
-};
-// --- Slideshow JAVASCRIPT End ---
-</script>
-</body>
-</html>
-"""
-
-# ২. CART TEMPLATE
-cart_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🛒 FOODIFY Cart</title>
-<link href='https://fonts.googleapis.com/css?family=Poppins' rel='stylesheet'>
-<style>
-/* Green Theme Colors */
-:root {
-    --primary-color: #4CAF50; /* Green 500 */
-    --primary-dark: #388E3C; /* Green 700 */
-    --red-alert: #F44336;
-    --red-alert-dark: #D32F2F;
-}
-body { font-family:'Poppins',sans-serif;margin:0;background:#f8f8f8;color:#333; }
-header { 
-    background:var(--primary-color);
-    color:white;
-    padding:15px;
-    text-align:center;
-    font-size:24px;
-    font-weight:bold;
-    box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    min-height: 60px;
-}
-header img { 
-    height: 40px; 
-    vertical-align: middle; 
-    border-radius: 4px;
-    max-width: 90%;
-}
-.container { padding:20px;max-width:800px;margin:20px auto;background:white;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1); }
-.back-link { display:block;margin-bottom:20px;color:var(--primary-color);text-decoration:none;font-weight:600; }
-.cart-item { display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #eee; }
-.item-info { flex-grow:1; }
-.item-total { font-weight:bold;color:var(--primary-color); }
-.checkout-box { border-top:2px solid var(--primary-color);padding-top:20px;margin-top:20px; }
-.total-display { font-size:1.5em;font-weight:bold;margin-bottom:5px; }
-.delivery-form input, .delivery-form textarea { width:100%;padding:10px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box; }
-button { background:var(--primary-color);border:none;color:white;padding:12px 20px;border-radius:8px;cursor:pointer;font-weight:600;transition:background 0.2s;width:100%;margin-top:10px; }
-button:hover { background:var(--primary-dark); }
-.remove-btn { background:var(--red-alert);padding:5px 10px;border-radius:5px;width:auto;font-weight:500; }
-.remove-btn:hover { background:var(--red-alert-dark); }
-</style>
-</head>
-<body>
-<header>
-    {% if logo_url and logo_url != default_logo %}
-        <img src="{{logo_url}}" alt="Website Logo">
-    {% else %}
-        🛒 FOODIFY Cart
-    {% endif %}
-</header>
-<div class="container">
-    <a href="/" class="back-link">← Continue Shopping</a>
-    {% if cart %}
-        {% for item in cart %}
-        <div class="cart-item">
-            <div class="item-info">
-                {{item['name']}} (× {{item['qty']}})
-                <br>
-                <small>@ ₹{{item['price']}} per item</small>
-            </div>
-            <div class="item-total">
-                ₹{{item['price'] * item['qty']}}
-            </div>
-            <form action="{{url_for('remove_from_cart')}}" method="POST" style="margin-left:15px;">
-                <input type="hidden" name="name" value="{{item['name']}}">
-                <button type="submit" class="remove-btn">Remove</button>
-            </form>
-        </div>
+        <p>No food items available at the moment. Please check back later.</p>
         {% endfor %}
-        
-        <div class="checkout-box">
-            <div class="total-display">
-                Subtotal: ₹{{base_total}}
-            </div>
-            <!-- Delivery Charge Display -->
-            <div style="font-size:1.1em; color:var(--primary-color); font-weight:600; margin-bottom:10px;">
-                Delivery Charge: ₹{{delivery_charge}}
-            </div>
-            <!-- Grand Total Display -->
-            <div class="total-display" style="font-size:1.8em; border-top: 1px dashed #ccc; padding-top: 10px;">
-                Grand Total: ₹{{total}}
-            </div>
-
-            <h3>Delivery Information</h3>
-            <form action="{{url_for('checkout')}}" method="POST" class="delivery-form">
-                <input type="text" name="name" placeholder="Your Name (Name)" required>
-                <input type="text" name="phone" placeholder="Phone Number (Phone Number)" required>
-                <textarea name="address" placeholder="Delivery Address (Address)" required rows="3"></textarea>
-                <input type="text" name="pincode" placeholder="Pincode (Pincode)" required>
-                <input type="text" name="landmark" placeholder="Nearby Landmark (Landmark)" required>
-                
-                <button type="submit">Confirm Order (Grand Total: ₹{{total}})</button>
-            </form>
-        </div>
-    {% else %}
-        <h3 style="text-align:center;">Cart is Empty! Order some food.</h3>
-    {% endif %}
-</div>
-</body>
-</html>
-"""
-
-# ৩. ADMIN LOGIN TEMPLATE
-admin_login_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🔑 Admin Login</title>
-    <link href='https://fonts.googleapis.com/css?family=Poppins' rel='stylesheet'>
-    <style>
-        /* Green Theme Colors */
-        :root {
-            --primary-color: #4CAF50; 
-            --primary-dark: #388E3C; 
-        }
-        body { font-family:'Poppins',sans-serif;margin:0;background:#f8f8f8;color:#333;text-align:center;padding-top:50px; }
-        .login-box { background:white;padding:30px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1);display:inline-block;max-width:350px;width:90%; }
-        h1 { color:var(--primary-color);font-size:1.8em;margin-bottom:20px; }
-        input[type="text"], input[type="password"] { width:100%;padding:12px;margin-bottom:15px;border:1px solid #ccc;border-radius:8px;box-sizing:border-box; }
-        button { background:var(--primary-color);border:none;color:white;padding:12px 20px;border-radius:8px;cursor:pointer;font-weight:600;transition:background 0.2s;width:100%; }
-        button:hover { background:var(--primary-dark); }
-        .msg { color:red;margin-bottom:10px;font-weight:500; }
-        .note { color:gray;font-size:0.9em;margin-top:10px; }
-    </style>
-</head>
-<body>
-    <div class="login-box">
-        <h1>Admin Login</h1>
-        {% if msg %}<p class="msg">{{msg}}</p>{% endif %}
-        <form method="POST">
-            <input type="text" name="userid" placeholder="User ID" required>
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Log In</button>
-        </form>
-        <p class="note">Enter your admin credentials to access the panel.</p>
     </div>
-</body>
-</html>
+{% endblock %}
 """
 
-# ৪. ADMIN PANEL TEMPLATE
-admin_panel_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚙️ FOODIFY Admin Panel</title>
-    <link href='https://fonts.googleapis.com/css?family=Poppins' rel='stylesheet'>
-    <style>
-        /* Green Theme Colors */
-        :root {
-            --primary-color: #4CAF50; 
-            --primary-dark: #388E3C; 
-            --red-alert: #F44336;
-            --blue-accent: #2196F3;
-        }
-        body { font-family:'Poppins',sans-serif;margin:0;background:#f8f8f8;color:#333; }
-        header { 
-            background:var(--primary-color);
-            color:white;
-            padding:15px;
-            text-align:center;
-            font-size:24px;
-            font-weight:bold;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 60px;
-        }
-        header img { 
-            height: 40px; 
-            vertical-align: middle; 
-            border-radius: 4px;
-            max-width: 90%;
-        }
-        .container { padding:20px;max-width:1200px;margin:20px auto; }
-        .section { background:white;padding:20px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.05);margin-bottom:30px; }
-        h2 { color:var(--primary-color);border-bottom:2px solid #eee;padding-bottom:10px;margin-bottom:20px; }
-        form input, form button, form select { padding:8px;margin-right:10px;border-radius:6px;border:1px solid #ccc; }
-        form button { background:var(--primary-dark);color:white;border:none;cursor:pointer;transition:background 0.2s; }
-        form button:hover { background:var(--primary-dark); }
-        
-        table { width:100%;border-collapse:collapse;margin-top:15px; }
-        th, td { padding:10px;border:1px solid #ddd;text-align:left;font-size:0.9em; }
-        th { background:#f4f4f4;font-weight:600; }
-        .remove-btn { background:var(--red-alert); }
-        .remove-btn:hover { background:#D32F2F; }
-        .product-list img { width:50px;height:50px;object-fit:cover;border-radius:4px; }
-        .bill-btn { background:var(--blue-accent); }
-        .bill-btn:hover { background:#1976D2; }
-        .upload-btn { background:#03A9F4 !important; }
-        .logo-display { 
-            margin-top:10px; 
-            padding-top:10px; 
-            border-top: 1px dashed #ccc;
-        }
-        .download-btn { background:#00bcd4 !important; color:white; }
-    </style>
-</head>
-<body>
-<header>
-    {% if logo_url and logo_url != default_logo %}
-        <img src="{{logo_url}}" alt="Website Logo">
-    {% endif %}
-    ⚙️ FOODIFY Admin Panel
-</header>
-<div class="container">
-    <a href="/" style="display:inline-block; margin-bottom:20px; color:var(--primary-color); text-decoration:none;">← Go to Homepage</a>
-
-    <!-- Change Website Logo (New Section) -->
-    <div class="section">
-        <h2>Change Website Logo</h2>
-        <form action="{{url_for('upload_logo')}}" method="POST" enctype="multipart/form-data">
-            <input type="file" name="logo_image" required accept="image/*" style="border: none;">
-            <button type="submit" class="upload-btn">Upload Logo</button>
-        </form>
-        <div class="logo-display">
-            <p>Current Logo:</p>
-            <img src="{{logo_url}}" alt="Current Logo" style="max-width:150px; height:auto; border:1px solid #ccc; border-radius:8px;">
-            {% if logo_url == default_logo %}
-                <p style="color:gray; font-size: 0.8em; margin-top:5px;">(Showing default text logo)</p>
+# --- Order Page Template ---
+CART_TEMPLATE = """
+{% extends "base.html" %}
+{% block title %}Your Cart - FOODIFY{% endblock %}
+{% block content %}
+<h1 class="text-center mb-4">Your Cart & Checkout</h1>
+{% if error %}
+    <div class="alert alert-danger">{{ error }}</div>
+{% endif %}
+<form id="checkoutForm" method="post" action="{{ url_for('place_order') }}">
+    <div class="row">
+        <!-- Cart Items -->
+        <div class="col-md-6">
+            <h2>Order Summary</h2>
+            {% if cart_items %}
+                <ul class="list-group mb-3">
+                    {% for item in cart_items %}
+                    <li class="list-group-item d-flex justify-content-between lh-sm">
+                        <div>
+                            <h6 class="my-0">{{ item.food.name }}</h6>
+                            <small class="text-muted">Quantity: {{ item.quantity }}</small>
+                        </div>
+                        <span class="text-muted">Rs {{ "%.2f"|format(item.subtotal) }}</span>
+                    </li>
+                    {% endfor %}
+                    <li class="list-group-item d-flex justify-content-between">
+                        <span>Total (INR)</span>
+                        <strong>Rs {{ "%.2f"|format(total_bill) }}</strong>
+                    </li>
+                </ul>
+                <a href="{{ url_for('clear_cart') }}" class="btn btn-sm btn-danger">Clear Cart</a>
+            {% else %}
+                <p>Your cart is empty.</p>
+                <a href="{{ url_for('index') }}" class="btn btn-primary">Continue Shopping</a>
             {% endif %}
         </div>
-    </div>
-
-    <!-- Add Product -->
-    <div class="section">
-        <h2>Add Product</h2>
-        <form action="{{url_for('add_product')}}" method="POST" enctype="multipart/form-data">
-            <input type="text" name="name" placeholder="Product Name" required>
-            <input type="number" name="price" placeholder="Price (₹)" required>
-            <input type="number" name="qty" placeholder="Quantity" required>
-            <input type="file" name="image" required accept="image/*" style="border: none;">
-            <button type="submit">Add</button>
-        </form>
-    </div>
-
-    <!-- Current Products -->
-    <div class="section product-list">
-        <h2>Current Products (Stock)</h2>
-        <table>
-            <thead>
-                <tr><th>Image</th><th>Name</th><th>Price</th><th>Quantity</th><th>Action</th></tr>
-            </thead>
-            <tbody>
-                {% for p in products %}
-                <tr>
-                    <td><img src="{{p['image']}}" alt="{{p['name']}}"></td>
-                    <td>{{p['name']}}</td>
-                    <td>₹{{p['price']}}</td>
-                    <td>{{p['quantity']}}</td>
-                    <td>
-                        <form action="{{url_for('remove_product')}}" method="POST" style="display:inline;">
-                            <input type="hidden" name="name" value="{{p['name']}}">
-                            <button type="submit" class="remove-btn">Delete</button>
-                        </form>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-
-    <!-- New Orders -->
-    <div class="section">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <h2>New Orders</h2>
-            <a href="{{url_for('download_orders')}}"><button class="download-btn">Download Excel</button></a>
+        <!-- Customer Details -->
+        {% if cart_items %}
+        <div class="col-md-6">
+            <h2>Delivery Details</h2>
+            <div class="mb-3">
+                <label for="customer_name" class="form-label">Full Name</label>
+                <input type="text" class="form-control" id="customer_name" name="customer_name" required>
+            </div>
+            <div class="mb-3">
+                <label for="customer_phone" class="form-label">Mobile Number</label>
+                <input type="tel" class="form-control" id="customer_phone" name="customer_phone" required>
+            </div>
+            <div class="mb-3">
+                <label for="customer_address" class="form-label">Delivery Address</label>
+                <textarea class="form-control" id="customer_address" name="customer_address" rows="2" required></textarea>
+                <button type="button" id="getLocationBtn" class="btn btn-secondary btn-sm mt-2">Auto-detect Address</button>
+            </div>
+            <div class="row">
+                <div class="col-md-6 mb-3">
+                    <label for="pincode" class="form-label">PIN Code</label>
+                    <input type="text" class="form-control" id="pincode" name="pincode" required>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label for="landmark" class="form-label">Landmark</label>
+                    <input type="text" class="form-control" id="landmark" name="landmark" placeholder="near school, club, etc.">
+                </div>
+            </div>
+            <button type="submit" class="btn btn-success w-100 mt-3">Place Order</button>
         </div>
-        <table>
-            <thead>
-                <tr>
-                    <th>Order ID</th>
-                    <th>Status</th>
-                    <th>Customer</th>
-                    <th>Phone/Address</th>
-                    <th>Items</th>
-                    <th>Grand Total</th>
-                    <th>Time</th>
-                    <th>Action</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for o in orders | reverse %}
-                <tr>
-                    <td>{{o['id']}}</td>
-                    <td style="text-transform:capitalize;">
-                        {% set st = o.get('status','new') %}
-                        {% if st == 'confirmed' %}
-                            <span style="color:green;font-weight:600;">Confirmed</span>
-                        {% elif st == 'cancelled' %}
-                            <span style="color:#f44336;font-weight:600;">Cancelled</span>
-                        {% else %}
-                            <span style="color:#ff9800;font-weight:600;">New</span>
-                        {% endif %}
-                    </td>
-                    <td>{{o['name']}}<br><small>{{o['pincode']}}</small></td>
-                    <td>{{o['phone']}}<br><small>{{o['address']}}, {{o['landmark']}}</small></td>
-                    <td>
-                        <ul>
-                        {% for item in o['cart'] %}
-                            <li>{{item['name']}} (x{{item['qty']}})</li>
-                        {% endfor %}
-                        </ul>
-                    </td>
-                    <td>₹{{o['total']}}</td>
-                    <td>{{o.get('timestamp', 'N/A')[:10]}}</td>
-                    <td>
-                        <a href="{{url_for('download_bill', order_id=o['id'])}}" target="_blank">
-                            <button class="bill-btn">Download Bill</button>
-                        </a>
-                        <form action="{{url_for('confirm_order')}}" method="POST" style="display:inline;margin-left:6px;">
-                            <input type="hidden" name="order_id" value="{{o['id']}}">
-                            <button type="submit" class="bill-btn" {% if o.get('status') == 'confirmed' %}disabled{% endif %}>Confirm</button>
-                        </form>
-                        <form action="{{url_for('cancel_order')}}" method="POST" style="display:inline;margin-left:6px;">
-                            <input type="hidden" name="order_id" value="{{o['id']}}">
-                            <button type="submit" class="remove-btn" {% if o.get('status') == 'cancelled' %}disabled{% endif %}>Cancel</button>
-                        </form>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+        {% endif %}
     </div>
-
-    <!-- Notification Settings (New Section) -->
-    <div class="section">
-        <h2>Notification</h2>
-        <p style="color:gray;">Built-in notification sound is used. Upload option removed.</p>
-    </div>
-</div>
+</form>
+{% endblock %}
+{% block scripts %}
 <script>
-let currentOrderCount = {{orders|length}};
-let notificationSound = new Audio('data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4LjI5LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAUAAAiSAAODg4ODg4ODg4ODh4eHh4eHh4eHh4uLi4uLi4uLi4uPj4+Pj4+Pj4+Pj5OTk5OTk5OTk5OXl5eXl5eXl5eXm5ubm5ubm5ubm5+fn5+fn5+fn5+jo6Ojo6Ojo6Ojp6enp6enp6enp6urq6urq6urq6uvr6+vr6+vr6+vr7Ozs7Ozs7Ozs7O3t7e3t7e3t7e3u7u7u7u7u7u7u7+/v7+/v7+/v7+//8AAAAATGF2YzU4LjU0AAAAAAAAAAAAAAAAJAAAAAAAAAAAIkgPYLiYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV');
-let playCount = 0;
-const TOTAL_PLAYS = 40;
-
-// Function to play notification sound
-function playNotification() {
-    if (playCount >= TOTAL_PLAYS) {
-        playCount = 0;
-        return;
-    }
-
-    notificationSound.play().then(() => {
-        console.log(`Playing notification sound: ${playCount + 1}/${TOTAL_PLAYS}`);
-        playCount++;
-        
-        // When sound ends, play again if count not reached
-        notificationSound.onended = function() {
-            if (playCount < TOTAL_PLAYS) {
-                playNotification();
-            } else {
-                playCount = 0;
-                notificationSound.onended = null;
-            }
-        };
-    }).catch(error => {
-        console.error("Error playing notification:", error);
-    });
-}
-
-// Check for new orders
-function checkNewOrders() {
-    fetch('/check_new_orders')
-        .then(response => response.json())
-        .then(data => {
-            if (data.count > currentOrderCount) {
-                console.log("New order detected! Playing notification...");
-                playCount = 0;  // Reset count
-                playNotification();  // Start playing notifications
-                
-                // Update current count
-                currentOrderCount = data.count;
-                
-                // Show browser notification
-                if ("Notification" in window) {
-                    Notification.requestPermission().then(permission => {
-                        if (permission === "granted") {
-                            new Notification("New Order!", {
-                                body: "You have received a new order!"
-                            });
-                        }
+    // Geolocation
+    document.getElementById('getLocationBtn').addEventListener('click', function() {
+        if (navigator.geolocation) {
+            this.textContent = 'Detecting...';
+            this.disabled = true;
+            navigator.geolocation.getCurrentPosition(position => {
+                const lat = position.coords.latitude;
+                const lon = position.coords.longitude;
+                // Using a free reverse geocoding service for demo purposes
+                fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('customer_address').value = data.display_name || 'Could not find address.';
+                        this.textContent = 'Auto-detect Address';
+                        this.disabled = false;
+                    })
+                    .catch(() => {
+                        document.getElementById('customer_address').value = `Lat: ${lat}, Lon: ${lon}. (Could not fetch address)`;
+                        this.textContent = 'Auto-detect Address';
+                        this.disabled = false;
                     });
-                }
-                
-                // Reload page after 2 seconds
-                setTimeout(() => {
-                    location.reload();
-                }, 2000);
-            }
-        })
-        .catch(error => console.error("Error checking orders:", error));
-}
-
-// Check for new orders every 5 seconds
-setInterval(checkNewOrders, 5000);
+            }, () => {
+                alert('Geolocation failed or was denied.');
+                this.textContent = 'Auto-detect Address';
+                this.disabled = false;
+            });
+        } else {
+            alert('Geolocation is not supported by your browser.');
+        }
+    });
 </script>
-</body>
-</html>
+{% endblock %}
 """
 
+# --- Order Success Template ---
+ORDER_SUCCESS_TEMPLATE = """
+{% extends "base.html" %}
+{% block title %}Order Confirmed - FOODIFY{% endblock %}
+{% block content %}
+<div class="text-center">
+    <h1 class="text-success">✅ Order Placed Successfully!</h1>
+    <p class="lead">Thank you for your order, {{ order.customer_name }}.</p>
+    <div class="card w-75 mx-auto my-4">
+        <div class="card-header">
+            Order Summary (ID: #{{ order.id }})
+        </div>
+        <div class="card-body text-start">
+            <p><strong>Name:</strong> {{ order.customer_name }}</p>
+            <p><strong>Phone:</strong> {{ order.customer_phone }}</p>
+            <p><strong>Address:</strong> {{ order.customer_address }}</p>
+            <hr>
+            <h6>Items:</h6>
+            <ul>
+            {% for item in order.items %}
+                <li>{{ item.food_name }} x {{ item.quantity }} - Rs {{ "%.2f"|format(item.price * item.quantity) }}</li>
+            {% endfor %}
+            </ul>
+            <hr>
+            <h5 class="text-end">Total Bill: Rs {{ "%.2f"|format(order.total_bill) }}</h5>
+        </div>
+    </div>
+    <a href="{{ url_for('index') }}" class="btn btn-primary">Back to Home</a>
+</div>
+{% endblock %}
+"""
 
-# -------------------- ROUTES AND VIEW FUNCTIONS (Translated Strings) --------------------
+# --- Admin Login Template ---
+ADMIN_LOGIN_TEMPLATE = """
+{% extends "base.html" %}
+{% block title %}Admin Login - FOODIFY{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <h1 class="text-center">Admin Login</h1>
+        {% if error %}
+            <div class="alert alert-danger">{{ error }}</div>
+        {% endif %}
+        <form method="post">
+            <div class="mb-3">
+                <label for="username" class="form-label">Username</label>
+                <input type="text" class="form-control" id="username" name="username" required>
+            </div>
+            <div class="mb-3">
+                <label for="password" class="form-label">Password</label>
+                <input type="password" class="form-control" id="password" name="password" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Login</button>
+        </form>
+    </div>
+</div>
+{% endblock %}
+"""
 
-@app.route("/")
-def home():
-    """Displays the main product page."""
-    products = load_json(PRODUCT_FILE)
-    cart_count = sum(item.get("qty", 1) for item in session.get("cart", []))
-    config = load_config()
-    logo_url = config.get("logo_url", DEFAULT_LOGO)
+# --- Admin Dashboard Template ---
+ADMIN_DASHBOARD_TEMPLATE = """
+{% extends "base.html" %}
+{% block title %}Admin Dashboard - FOODIFY{% endblock %}
+{% block head_extra %}
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1>Admin Dashboard</h1>
+    <a href="{{ url_for('admin_logout') }}" class="btn btn-danger">Logout</a>
+</div>
+
+<!-- Site Settings Section -->
+<div class="card mb-4">
+    <div class="card-header">
+        <h5>Site Settings</h5>
+    </div>
+    <div class="card-body">
+        <form action="{{ url_for('admin_settings') }}" method="post" enctype="multipart/form-data">
+            <div class="row align-items-center">
+                <div class="col-md-2">
+                    <label for="logo_file" class="form-label">Site Logo</label>
+                    {% if settings.logo_url %}
+                        <img src="{{ settings.logo_url }}" class="img-thumbnail" alt="Current Logo">
+                    {% else %}
+                        <p class="text-muted">No logo set.</p>
+                    {% endif %}
+                </div>
+                <div class="col-md-7">
+                    <input type="file" class="form-control" id="logo_file" name="logo_file">
+                    <small class="form-text text-muted">Upload a new logo. Recommended height: 40px.</small>
+                </div>
+                <div class="col-md-3">
+                    <button type="submit" class="btn btn-primary w-100">Save Settings</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Notification Popup -->
+<div id="notification" class="notification">
+    <strong>New Order!</strong> A new order has been placed.
+</div>
+
+<div class="row">
+    <!-- Manage Foods Section -->
+    <div class="col-md-5">
+        <h2>Manage Foods</h2>
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title">Add/Edit Food</h5>
+                <form action="{{ url_for('admin_add_edit_food') }}" method="post" enctype="multipart/form-data">
+                    <input type="hidden" name="food_id" id="food_id">
+                    <div class="mb-3">
+                        <label for="name" class="form-label">Food Name</label>
+                        <input type="text" class="form-control" id="name" name="name" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="price" class="form-label">Price</label>
+                        <input type="number" step="0.01" class="form-control" id="price" name="price" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="image_file" class="form-label">Food Image</label>
+                        <input type="file" class="form-control" id="image_file" name="image_file">
+                        <small class="form-text text-muted">Leave empty if you don't want to change the image.</small>
+                    </div>
+                    <button type="submit" class="btn btn-success">Save Food</button>
+                    <button type="button" class="btn btn-secondary" onclick="clearForm()">Clear</button>
+                </form>
+            </div>
+        </div>
+        <h3 class="mt-4">Existing Foods</h3>
+        <ul class="list-group">
+            {% for food in foods %}
+            <li class="list-group-item d-flex justify-content-between align-items-center">
+                {{ food.name }} - Rs {{ "%.2f"|format(food.price) }}
+                <div>
+                    <button class="btn btn-sm btn-info" onclick="editFood('{{ food.id }}', '{{ food.name }}', '{{ food.price }}')">Edit</button>
+                    <a href="{{ url_for('admin_delete_food', food_id=food.id) }}" class="btn btn-sm btn-danger" onclick="return confirm('Are you sure?')">Delete</a>
+                </div>
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+
+    <!-- View Orders Section -->
+    <div class="col-md-7">
+        <h2>Customer Orders</h2>
+        <div id="orders-list">
+            {% include 'admin_orders_partial.html' %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+    function clearForm() {
+        document.getElementById('food_id').value = '';
+        document.getElementById('name').value = '';
+        document.getElementById('price').value = '';
+        document.getElementById('image_file').value = '';
+    }
+
+    function editFood(id, name, price) {
+        document.getElementById('food_id').value = id;
+        document.getElementById('name').value = name;
+        document.getElementById('price').value = price;
+        window.scrollTo(0, 0);
+    }
+
+    // Socket.IO for live notifications
+    document.addEventListener('DOMContentLoaded', function () {
+        const socket = io();
+        const notification = document.getElementById('notification');
+
+        socket.on('new_order', function(data) {
+            console.log('New order received:', data.msg);
+            
+            // Show notification
+            notification.style.display = 'block';
+            setTimeout(() => {
+                notification.style.display = 'none';
+            }, 5000);
+
+            // Refresh orders list via AJAX
+            fetch("{{ url_for('admin_get_orders') }}")
+                .then(response => response.text())
+                .then(html => {
+                    document.getElementById('orders-list').innerHTML = html;
+                });
+        });
+    });
+</script>
+{% endblock %}
+"""
+
+# --- Admin Orders Partial (for AJAX refresh) ---
+ADMIN_ORDERS_PARTIAL = """
+{% for order in orders %}
+<div class="card mb-3">
+    <div class="card-header d-flex justify-content-between">
+        <strong>Order #{{ order.id }}</strong>
+        <span>{{ order.timestamp.strftime('%Y-%m-%d %H:%M') }}</span>
+    </div>
+    <div class="card-body">
+        <p><strong>Customer:</strong> {{ order.customer_name }} ({{ order.customer_phone }})</p>
+        <p><strong>Address:</strong> {{ order.customer_address }}</p>
+        <h6>Items:</h6>
+        <ul>
+        {% for item in order.items %}
+            <li>{{ item.food_name }} x {{ item.quantity }}</li>
+        {% endfor %}
+        </ul>
+        <hr>
+        <div class="d-flex justify-content-between align-items-center">
+            <h5 class="m-0">Total: Rs {{ "%.2f"|format(order.total_bill) }}</h5>
+            <div>
+                <a href="https://www.google.com/maps/search/?api=1&query={{ order.customer_address|urlencode }}" target="_blank" class="btn btn-info">View on Map</a>
+                <a href="{{ url_for('download_bill', order_id=order.id) }}" class="btn btn-primary">Download Bill</a>
+            </div>
+        </div>
+    </div>
+</div>
+{% else %}
+<p>No orders yet.</p>
+{% endfor %}
+"""
+
+# ==============================================================================
+# Маршруты Flask (Flask Routes)
+# ==============================================================================
+
+# --- Template dictionary and render helper ---
+TEMPLATES = {
+    "base.html": BASE_TEMPLATE,
+    "home.html": HOME_TEMPLATE,
+    "order.html": CART_TEMPLATE, # Renamed for clarity, used by cart_page
+    "order_success.html": ORDER_SUCCESS_TEMPLATE,
+    "admin_login.html": ADMIN_LOGIN_TEMPLATE,
+    "admin_dashboard.html": ADMIN_DASHBOARD_TEMPLATE,
+    "admin_orders_partial.html": ADMIN_ORDERS_PARTIAL,
+}
+
+# --- Helper function to render templates ---
+def render(template_name, **context):
+    # Create a Jinja environment with a DictLoader.
+    # This allows template inheritance (e.g., {% extends "base.html" %}) to work correctly
+    # with templates stored as strings in a dictionary.
+    jinja_env = app.jinja_env.overlay()
+    jinja_env.loader = DictLoader(TEMPLATES)
+
+    # Inject settings into all templates
+    logo_setting = db.session.get(AppSetting, 'logo_url')
+    logo_url = None
+    if logo_setting and logo_setting.value:
+        logo_url = url_for('uploaded_file', filename=logo_setting.value)
     
-    return render_template_string(home_html, products=products, cart_count=cart_count, logo_url=logo_url, default_logo=DEFAULT_LOGO)
+    context['settings'] = {'logo_url': logo_url}
 
-@app.route("/add_to_cart", methods=["POST"])
-def add_to_cart():
-    """Adds a product to the shopping cart."""
-    try:
-        name = request.form["name"]
-        price = int(request.form["price"])
-        qty = int(request.form["qty"])
-    except (KeyError, ValueError):
-        return redirect(url_for("home"))
+    template = jinja_env.get_template(template_name)
+    return template.render(**context)
 
-    if qty <= 0:
-        return redirect(url_for("home"))
+# --- Customer-facing Routes ---
 
-    cart = session.get("cart", [])
+@app.route('/')
+def index():
+    all_foods = Food.query.order_by(Food.name).all()
+    # Prepend the correct path for locally stored images
+    for food in all_foods:
+        if food.image_url and not food.image_url.startswith('http'):
+            food.image_url = url_for('uploaded_file', filename=food.image_url)
+    return render('home.html', foods=all_foods)
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    """Serves uploaded files."""
+    from flask import send_from_directory
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+@app.route('/cart/add/<int:food_id>', methods=['POST'])
+def add_to_cart(food_id):
+    if 'cart' not in session:
+        session['cart'] = {}
+
+    cart = session['cart']
+    quantity = int(request.form.get('quantity', 1))
     
-    found = False
-    for item in cart:
-        if item["name"] == name:
-            item["qty"] += qty
-            found = True
-            break
+    # Add or update quantity in cart
+    cart[str(food_id)] = cart.get(str(food_id), 0) + quantity
     
-    if not found:
-        cart.append({"name": name, "price": price, "qty": qty})
-        
-    session["cart"] = cart
-    return redirect(url_for("home"))
+    session.modified = True
+    return redirect(url_for('index'))
 
-@app.route("/remove_from_cart", methods=["POST"])
-def remove_from_cart():
-    """Removes an item from the cart."""
-    name_to_remove = request.form.get("name")
-    cart = session.get("cart", [])
-    updated_cart = [item for item in cart if item['name'] != name_to_remove]
-    session["cart"] = updated_cart
-    return redirect(url_for("cart"))
-
-
-@app.route("/cart")
-def cart():
-    """Displays the shopping cart page, calculates total including delivery charge."""
-    cart = session.get("cart", [])
-    base_total = sum(c["price"]*c["qty"] for c in cart)
+@app.route('/cart')
+def cart_page():
+    cart = session.get('cart', {})
+    cart_items = []
+    total_bill = 0
     
-    # Add delivery charge only if cart is not empty
-    delivery_charge = DELIVERY_CHARGE if base_total > 0 else 0
-    total = base_total + delivery_charge
+    for food_id, quantity in cart.items():
+        food = Food.query.get(food_id)
+        if food:
+            subtotal = food.price * quantity
+            cart_items.append({'food': food, 'quantity': quantity, 'subtotal': subtotal})
+            total_bill += subtotal
+            
+    return render('order.html', cart_items=cart_items, total_bill=total_bill, error=request.args.get('error'))
 
-    config = load_config()
-    logo_url = config.get("logo_url", DEFAULT_LOGO)
+@app.route('/cart/clear')
+def clear_cart():
+    session.pop('cart', None)
+    return redirect(url_for('cart_page'))
+
+@app.route('/place_order', methods=['POST'])
+def place_order():
+    # PIN Code Validation
+    pincode = request.form.get('pincode', '').strip()
+    if pincode != '743425':
+        error_msg = "Our order service is not available in this location."
+        return redirect(url_for('cart_page', error=error_msg))
+
+    # Extract form data
+    customer_name = request.form.get('customer_name')
+    customer_phone = request.form.get('customer_phone')
+    full_address = request.form.get('customer_address')
+    landmark = request.form.get('landmark')
     
-    # Pass base_total and delivery_charge to the template
-    return render_template_string(
-        cart_html, 
-        cart=cart, 
-        base_total=base_total, 
-        delivery_charge=delivery_charge, 
-        total=total, 
-        logo_url=logo_url, 
-        default_logo=DEFAULT_LOGO
-    )
+    # Combine address parts
+    delivery_address = f"{full_address}, Landmark: {landmark}, PIN: {pincode}"
 
-@app.route("/checkout", methods=["POST"])
-def checkout():
-    """Processes the order, saves it, and updates inventory."""
-    cart = session.get("cart", [])
+    cart = session.get('cart', {})
     if not cart:
-        return "<h2>❌ Cannot Place Order: Cart is Empty!</h2><a href='/'>Go back to Homepage</a>"
-        
-    try:
-        base_total = sum(c["price"]*c["qty"] for c in cart)
-        delivery_charge = DELIVERY_CHARGE
-        total_amount = base_total + delivery_charge # Grand Total
-        
-        order = {
-            "name": request.form["name"], 
-            "phone": request.form["phone"],
-            "address": request.form["address"], 
-            "pincode": request.form["pincode"],
-            "landmark": request.form["landmark"], 
-            "cart": cart,
-            "base_total": base_total,        # New: Store subtotal
-            "delivery_charge": delivery_charge, # New: Store delivery charge
-            "total": total_amount,          # Grand Total
-            "id": datetime.now().strftime("%Y%m%d%H%M%S") + str(int(time.time() * 1000) % 10000).zfill(4), 
-            "timestamp": datetime.now().isoformat()
-        }
-    except KeyError:
-        return "<h2>❌ Delivery details are incomplete!</h2><a href='/cart'>Go back to Cart</a>"
+        return redirect(url_for('cart_page'))
 
-
-    # 1. Update Order File (This is where the error occurred previously)
-    orders = load_json(ORDER_FILE)
-    orders.append(order)
-    save_json(ORDER_FILE, orders)
-
-    # 2. Update Product Inventory
-    products = load_json(PRODUCT_FILE)
-    product_map = {p["name"]: p for p in products}
-
-    for item in order["cart"]:
-        product_name = item["name"]
-        ordered_qty = item["qty"]
-        if product_name in product_map:
-            product_map[product_name]["quantity"] -= ordered_qty
-            if product_map[product_name]["quantity"] < 0:
-                product_map[product_name]["quantity"] = 0 
-
-    save_json(PRODUCT_FILE, products)
+    total_bill = 0
+    order_items = []
     
-    # 3. Clear Cart
-    session["cart"] = []
-    
-    # Updated Success Message with Green Theme and Delivery Charge Info
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head><title>Order Confirmed</title>
-    <link href='https://fonts.googleapis.com/css?family=Poppins' rel='stylesheet'>
-    <style>
-        body {{ font-family:'Poppins',sans-serif;background:#e8f5e9;color:#333;text-align:center;padding-top:100px; }}
-        .box {{ background:white;padding:30px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1);display:inline-block; }}
-        h2 {{ color:#4CAF50; font-size: 2em; }}
-        p {{ font-size: 1.1em; }}
-        a {{ background:#4CAF50;color:white;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;margin-top:20px;display:inline-block; }}
-        a:hover {{ background:#388E3C; }}
-    </style>
-    </head>
-    <body>
-        <div class="box">
-            <h2>✅ Order Successful!</h2>
-            <p>Your Order ID: <strong>{order['id']}</strong></p>
-            <p>Grand Total: <strong>₹{order['total']}</strong> (Includes Delivery Charge of ₹{order['delivery_charge']})</p>
-            <p>Your food will be delivered to your address soon.</p>
-            <a href='/'>Go back to Homepage</a>
-        </div>
-    </body>
-    </html>
-    """
+    for food_id, quantity in cart.items():
+        food = Food.query.get(food_id)
+        if food and quantity > 0:
+            total_bill += food.price * quantity
+            order_items.append(OrderItem(
+                food_name=food.name,
+                quantity=quantity,
+                price=food.price
+            ))
 
-@app.route("/admin", methods=["GET","POST"])
-def admin_login():
-    """Admin login page."""
-    msg=""
-    if request.method=="POST":
-        if request.form["userid"]=="SUBHAJIT" and request.form["password"]=="8167":
-            session["admin"]=True
-            return redirect("/panel")
-        else: 
-            msg="Wrong ID or Password! (ভুল আইডি বা পাসওয়ার্ড!)"
-    return render_template_string(admin_login_html, msg=msg)
+    if not order_items:
+        return redirect(url_for('cart_page'))
 
-@app.route("/panel")
-def panel():
-    """Admin panel dashboard."""
-    if not session.get("admin"): 
-        return redirect("/admin")
-    products = load_json(PRODUCT_FILE)
-    orders = load_json(ORDER_FILE)
-    config = load_config()
-    logo_url = config.get("logo_url", DEFAULT_LOGO)
-    notification_sound = config.get("notification_sound", DEFAULT_RINGTONE)
-    return render_template_string(
-        admin_panel_html, 
-        products=products, 
-        orders=orders, 
-        logo_url=logo_url, 
-        default_logo=DEFAULT_LOGO,
-        notification_sound=notification_sound
+    # Create new order
+    new_order = Order(
+        customer_name=customer_name,
+        customer_phone=customer_phone,
+        customer_address=delivery_address,
+        total_bill=total_bill,
+        items=order_items
     )
+    db.session.add(new_order)
+    db.session.commit()
 
-@app.route("/upload_logo", methods=["POST"])
-def upload_logo():
-    """Uploads website logo and updates configuration."""
-    if not session.get("admin"): return redirect("/admin")
+    session.pop('cart', None) # Clear cart after order
+    socketio.emit('new_order', {'msg': f'New order #{new_order.id} placed!'}, namespace='/')
+    return redirect(url_for('order_success', order_id=new_order.id))
+
+@app.route('/order/success/<int:order_id>')
+def order_success(order_id):
+    order = Order.query.get_or_404(order_id)
+    return render('order_success.html', order=order)
+
+# --- Admin Routes ---
+
+@app.route('/admin', methods=['GET', 'POST'])
+def admin_login():
+    if 'admin_logged_in' in session:
+        return redirect(url_for('admin_dashboard'))
     
-    file = request.files.get("logo_image")
-    if not file or file.filename == '':
-        return "Logo file missing", 400
-        
-    try:
-        # Securely save the file
-        filename = secure_filename(file.filename)
-        unique_filename = f"logo_{int(time.time())}_{filename}"
-        path = os.path.join("static/uploads", unique_filename)
-        file.save(path)
-        logo_url = "/" + path.replace("\\", "/")
-        
-        config = load_config()
-        config["logo_url"] = logo_url
-        save_config(config)
-        
-    except Exception as e:
-        print(f"Error uploading logo: {e}")
-        return f"An error occurred: {e}", 500
-        
-    return redirect(url_for("panel"))
-
-
-@app.route("/add_product", methods=["POST"])
-def add_product():
-    """Adds a new product to the inventory."""
-    if not session.get("admin"): return redirect("/admin")
-    
-    try:
-        file = request.files["image"]
-        if not file:
-            return "Image file missing", 400
+    error = None
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+            session['admin_logged_in'] = True
+            return redirect(url_for('admin_dashboard'))
+        else:
+            error = 'Invalid credentials. Please try again.'
             
-        # Securely save the file
-        filename = secure_filename(file.filename)
-        unique_filename = f"{int(time.time())}_{filename}"
-        path = os.path.join("static/uploads", unique_filename)
-        file.save(path)
-        image_url = "/" + path.replace("\\", "/")
-        
-        products = load_json(PRODUCT_FILE)
-        products.append({
-            "name": request.form["name"],
-            "price": int(request.form["price"]),
-            "quantity": int(request.form["qty"]),
-            "image": image_url
-        })
-        save_json(PRODUCT_FILE, products)
-    except Exception as e:
-        print(f"Error adding product: {e}")
-        return f"An error occurred: {e}", 500
-        
-    return redirect("/panel")
+    return render('admin_login.html', error=error)
 
-@app.route("/remove_product", methods=["POST"])
-def remove_product():
-    """Removes a product from the inventory."""
-    if not session.get("admin"): return redirect("/admin")
-    product_name = request.form.get("name")
+@app.route('/admin/dashboard')
+def admin_dashboard():
+    if 'admin_logged_in' not in session:
+        return redirect(url_for('admin_login', error=request.args.get('error')))
     
-    if not product_name:
-        return "Product name missing.", 400
-        
-    products = load_json(PRODUCT_FILE)
-    
-    # Code to remove the product's image
-    product_to_remove = next((p for p in products if p.get("name") == product_name), None)
-    if product_to_remove and 'image' in product_to_remove:
-        image_path = product_to_remove['image'].lstrip('/')
-        full_path = os.path.join(app.root_path, image_path)
-        if os.path.exists(full_path) and not full_path.endswith('placehold.co'):
-            try:
-                os.remove(full_path)
-            except OSError as e:
-                print(f"Error deleting image: {e}")
-    
-    updated_products = [p for p in products if p.get("name") != product_name]
-    
-    save_json(PRODUCT_FILE, updated_products)
-    return redirect("/panel")
+    foods = Food.query.order_by(Food.name).all()
+    orders = Order.query.order_by(Order.timestamp.desc()).all()
+    for food in foods:
+        if food.image_url and not food.image_url.startswith('http'):
+            food.image_url = url_for('uploaded_file', filename=food.image_url)
+    return render('admin_dashboard.html', foods=foods, orders=orders, error=request.args.get('error'))
 
-@app.route("/download_orders")
-def download_orders():
-    """Downloads all orders as an Excel file."""
-    if not session.get("admin"): return redirect("/admin")
-    orders = load_json(ORDER_FILE)
+@app.route('/admin/logout')
+def admin_logout():
+    session.pop('admin_logged_in', None)
+    return redirect(url_for('admin_login'))
+
+@app.route('/admin/food', methods=['POST'])
+def admin_add_edit_food():
+    if 'admin_logged_in' not in session:
+        return redirect(url_for('admin_login'))
     
-    wb = Workbook(); ws = wb.active
-    # Updated Excel Columns to include Subtotal and Delivery Charge
-    ws.append(["Order ID","Customer","Phone","Address","Pincode","Landmark","Items","Subtotal","Delivery Charge","Grand Total","Timestamp"])
-    for o in orders:
-        items = ", ".join([f"{i['name']} x{i['qty']}" for i in o["cart"]])
-        # Handle new fields (base_total, delivery_charge) and fall back gracefully for old orders
-        subtotal = o.get("base_total", o.get("total", 0) - o.get("delivery_charge", 0))
-        delivery = o.get("delivery_charge", 0)
-        grand_total = o.get("total", subtotal + delivery)
+    food_id = request.form.get('food_id')
+    name = request.form.get('name')
+    price = float(request.form.get('price'))
+    image_file = request.files.get('image_file')
 
-        timestamp = o.get("timestamp", "N/A") 
-        # Add new fields to the row
-        ws.append([o["id"],o["name"],o["phone"],o["address"],o["pincode"],o["landmark"],items, subtotal, delivery, grand_total, timestamp])
-    file = "data/orders.xlsx"; wb.save(file)
-    return send_file(file, as_attachment=True)
+    filename = None
+    if image_file and image_file.filename != '':
+        filename = secure_filename(image_file.filename)
+        image_file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
 
-@app.route("/download_bill/<order_id>")
+    if food_id: # Edit existing food
+        food = Food.query.get(food_id)
+        food.name = name
+        food.price = price
+        if filename:
+            # Optionally, delete the old file
+            # if food.image_url and os.path.exists(os.path.join(app.config['UPLOAD_FOLDER'], food.image_url)):
+            #     os.remove(os.path.join(app.config['UPLOAD_FOLDER'], food.image_url))
+            food.image_url = filename
+    else: # Add new food
+        if not filename: # Image is required for new food
+            # You might want to add an error message here
+            return redirect(url_for('admin_dashboard', error="An image is required when adding a new food item."))
+        new_food = Food(name=name, price=price, image_url=filename)
+        db.session.add(new_food)
+    
+    db.session.commit()
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/admin/food/delete/<int:food_id>')
+def admin_delete_food(food_id):
+    if 'admin_logged_in' not in session:
+        return redirect(url_for('admin_login'))
+    
+    food = Food.query.get_or_404(food_id)
+    db.session.delete(food)
+    db.session.commit()
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/admin/settings', methods=['POST'])
+def admin_settings():
+    if 'admin_logged_in' not in session:
+        return redirect(url_for('admin_login'))
+
+    logo_file = request.files.get('logo_file')
+    if logo_file and logo_file.filename != '':
+        filename = secure_filename(f"logo_{datetime.now().timestamp()}{os.path.splitext(logo_file.filename)[1]}")
+        logo_file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+
+        # Update setting in DB
+        logo_setting = db.session.get(AppSetting, 'logo_url')
+        if logo_setting:
+            logo_setting.value = filename
+        else:
+            logo_setting = AppSetting(key='logo_url', value=filename)
+            db.session.add(logo_setting)
+        db.session.commit()
+
+    return redirect(url_for('admin_dashboard'))
+
+# --- AJAX and Bill Download Routes ---
+
+@app.route('/admin/orders')
+def admin_get_orders():
+    """Endpoint for AJAX to fetch updated orders list."""
+    if 'admin_logged_in' not in session:
+        return "Unauthorized", 401
+    orders = Order.query.order_by(Order.timestamp.desc()).all()
+    return render('admin_orders_partial.html', orders=orders)
+
+@app.route('/download-bill/<int:order_id>')
 def download_bill(order_id):
-    """Generates a simple HTML bill for packaging."""
-    if not session.get("admin"): return redirect("/admin")
-    order = get_order_by_id(order_id)
-    if not order: return "Order not found", 404
+    if 'admin_logged_in' not in session:
+        return redirect(url_for('admin_login'))
+
+    order = Order.query.get_or_404(order_id)
     
-    order_time_raw = order.get('timestamp', datetime.now().isoformat()) 
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    
+    elements = []
+    
+    # Title
+    elements.append(Paragraph("FOODIFY Invoice", styles['h1']))
+    elements.append(Spacer(1, 12))
+    
+    # Order Details
+    elements.append(Paragraph(f"<b>Order ID:</b> #{order.id}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Date:</b> {order.timestamp.strftime('%Y-%m-%d %H:%M')}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Customer:</b> {order.customer_name}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Phone:</b> {order.customer_phone}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Address:</b> {order.customer_address}", styles['Normal']))
+    elements.append(Spacer(1, 24))
+
+    # Items Table
+    data = [['Item', 'Quantity', 'Unit Price', 'Total']]
+    for item in order.items:
+        data.append([item.food_name, item.quantity, f"Rs {item.price:.2f}", f"Rs {item.price * item.quantity:.2f}"])
+    
+    data.append(['', '', '<b>Total Bill</b>', f"<b>Rs {order.total_bill:.2f}</b>"])
+    
+    table = Table(data, colWidths=[200, 80, 80, 80])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1AD145")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -2), colors.beige),
+        ('GRID', (0, 0), (-1, -2), 1, colors.black),
+        ('ALIGN', (0, -1), (-1, -1), 'RIGHT'),
+        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+        ('TOPPADDING', (0, -1), (-1, -1), 12),
+    ]))
+    elements.append(table)
+    
+    doc.build(elements)
+    
+    buffer.seek(0)
+    return send_file(buffer, as_attachment=True, download_name=f'bill_order_{order.id}.pdf', mimetype='application/pdf')
+
+# ==============================================================================
+# Запуск приложения (Application Runner)
+# ==============================================================================
+
+def setup_database(app):
+    with app.app_context():
+        # Create upload folder if it doesn't exist
+        if not os.path.exists(UPLOAD_FOLDER):
+            os.makedirs(UPLOAD_FOLDER)
+        db.create_all()
+        # Add some initial food items if the database is empty.
+        # This is good for first-time setup.
+        if Food.query.count() == 0:
+            print("Database is empty. Seeding with initial food items...")
+            foods = [
+                Food(name='Classic Burger', price=8.99, image_url='https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&w=500'),
+                Food(name='Margherita Pizza', price=12.50, image_url='https://images.unsplash.com/photo-1598021680133-eb3a110d4c1c?auto=format&fit=crop&w=500'),
+                Food(name='Crispy Fries', price=4.00, image_url='https://images.unsplash.com/photo-1576107232684-c7e3e37b6929?auto=format&fit=crop&w=500'),
+                Food(name='Caesar Salad', price=9.25, image_url='https://images.unsplash.com/photo-1550304943-4f24f54ddde9?auto=format&fit=crop&w=500')
+            ]
+            db.session.bulk_save_objects(foods)
+            db.session.commit()
+        print("Database initialized and sample data checked.")
+
+def get_local_ip():
+    """Function to get the local IP address of the machine."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        order_time = datetime.fromisoformat(order_time_raw).strftime('%Y-%m-%d %I:%M %p')
-    except ValueError:
-        order_time = order_time_raw 
-        
-    # Get Subtotal and Delivery Charge from the order data
-    base_total = order.get('base_total', order['total'] - order.get('delivery_charge', 0)) # Fallback
-    delivery_charge = order.get('delivery_charge', 0)
-    
-    # Bill HTML Content (Updated with FOODIFY branding)
-    bill_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Order Invoice - {order_id}</title>
-        <style>
-            body {{ font-family: sans-serif; margin: 0; padding: 20px; }}
-            .invoice {{ width: 300px; border: 2px solid #4CAF50; padding: 15px; margin: 0 auto; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-            h1 {{ text-align: center; color: #4CAF50; margin-bottom: 5px; font-size: 1.5em; border-bottom: 2px solid #4CAF50; padding-bottom: 5px; }}
-            h2 {{ text-align: center; font-size: 1em; margin-top: 0; padding-bottom: 10px; font-weight: 400; }}
-            p {{ margin: 5px 0; font-size: 0.9em; line-height: 1.3; }}
-            strong {{ font-weight: 600; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-            th, td {{ padding: 5px 0; text-align: left; font-size: 0.9em; }}
-            th {{ border-bottom: 1px dashed #ccc; }}
-            .total-line {{ display: flex; justify-content: space-between; margin-top: 5px; }}
-            .total {{ font-weight: bold; border-top: 1px dashed #4CAF50; padding-top: 10px; font-size: 1.1em; color: #4CAF50; }}
-            .footer {{ text-align: center; margin-top: 15px; border-top: 1px dashed #ccc; padding-top: 10px; font-size: 0.8em; }}
-        </style>
-    </head>
-    <body onload="window.print()">
-        <div class="invoice">
-            <h1>FOODIFY</h1>
-            <h2>Packing Slip</h2>
-            
-            <p><strong>Order ID:</strong> {order['id']}</p>
-            <p><strong>Date/Time:</strong> {order_time}</p>
-            <br>
-            <p><strong>Customer:</strong> {order['name']}</p>
-            <p><strong>Phone:</strong> {order['phone']}</p>
-            <p><strong>Delivery Address:</strong> {order['address']}</p>
-            <p><strong>Pincode:</strong> {order['pincode']}</p>
-            <p><strong>Landmark:</strong> {order['landmark']}</p>
-            <br>
-            
-            <table>
-                <thead>
-                    <tr><th>Item</th><th>Quantity</th><th>Price (Unit)</th></tr>
-                </thead>
-                <tbody>
-                    {''.join([f"<tr><td>{item['name']}</td><td>{item['qty']}</td><td>₹{item['price']}</td></tr>" for item in order['cart']])}
-                </tbody>
-            </table>
-            
-            <div class="total-line"><p>Subtotal:</p><p>₹{base_total}</p></div>
-            <div class="total-line"><p style="color:#4CAF50;">Delivery Charge:</p><p style="color:#4CAF50;">₹{delivery_charge}</p></div>
-            
-            <div class="total total-line">
-                <p>Grand Total:</p><p>₹{order['total']}</p>
-            </div>
-            
-            <div class="footer">
-                Thank you for your order! - Call {order['phone']} for delivery (FOODIFY)
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return render_template_string(bill_content)
+        # Doesn't have to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1' # Fallback
+    finally:
+        s.close()
+    return IP
 
-@app.route('/check_new_orders')
-def check_new_orders():
-    """API endpoint to check for new orders."""
-    if not session.get("admin"):
-        return {"error": "Unauthorized"}, 401
-    
-    orders = load_json(ORDER_FILE)
-    return {"count": len(orders)}
+if __name__ == '__main__':
+    # This will create the database and tables if they don't exist
+    # before the server starts.
+    setup_database(app)
+    print("Starting FOODIFY server... Access it at http://127.0.0.1:5000 or your local IP.")
+    socketio.run(app, host="0.0.0.0", port=5000)
 
-@app.errorhandler(404)
-def handle_404(e):
-    """Handle 404 errors, especially for audio files"""
-    if request.path.startswith('/static/') and request.path.endswith(('.mp3', '.wav')):
-        return redirect(DEFAULT_RINGTONE)
-    return e
-
-@app.route("/confirm_order", methods=["POST"])
-def confirm_order():
-    """Mark an order as confirmed."""
-    if not session.get("admin"):
-        return redirect("/admin")
-    order_id = request.form.get("order_id")
-    if not order_id:
-        return redirect("/panel")
-    orders = load_json(ORDER_FILE)
-    changed = False
-    for o in orders:
-        if o.get("id") == order_id:
-            o["status"] = "confirmed"
-            o["confirmed_at"] = datetime.now().isoformat()
-            changed = True
-            break
-    if changed:
-        save_json(ORDER_FILE, orders)
-    return redirect("/panel")
-
-@app.route("/cancel_order", methods=["POST"])
-def cancel_order():
-    """Mark an order as cancelled and restock items.""" 
-    if not session.get("admin"):
-        return redirect("/admin")
-    order_id = request.form.get("order_id")
-    if not order_id:
-        return redirect("/panel")
-    orders = load_json(ORDER_FILE)
-    products = load_json(PRODUCT_FILE)
-    product_map = {p["name"]: p for p in products}
-    changed = False
-    for o in orders:
-        if o.get("id") == order_id:
-            if o.get("status") == "cancelled":
-                break
-            # Restock items back to products
-            for item in o.get("cart", []):
-                name = item.get("name")
-                try:
-                    qty = int(item.get("qty", 0))
-                except (TypeError, ValueError):
-                    qty = 0
-                if name in product_map:
-                    product_map[name]["quantity"] = product_map[name].get("quantity", 0) + qty
-            o["status"] = "cancelled"
-            o["cancelled_at"] = datetime.now().isoformat()
-            changed = True
-            break
-    if changed:
-        save_json(PRODUCT_FILE, list(product_map.values()))
-        save_json(ORDER_FILE, orders)
-    return redirect("/panel")
-# ...existing code...
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
+@app.cli.command("init-db")
+def init_db_command():
+    """Creates the database tables and seeds initial data."""
+    setup_database(app)
+    print("Database initialized.")
