@@ -79,19 +79,46 @@ BASE_TEMPLATE = """
     <title>{% block title %}FOODIFY{% endblock %}</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { font-family: 'Arial', sans-serif; background-color: #ebe6c7; }
-        .navbar { background-color: #198754; } /* Green */
+        body { font-family: 'Arial', sans-serif; background-color: #ffffff; }
+        .navbar { background-color: #ff6b00; } /* Orange */
         .navbar-brand, .nav-link { color: white !important; }
         .navbar-brand { font-weight: bold; font-size: 1.5rem; }
-        .card { border: 1px solid #198754; }
-        .card-title { color: #198754; }
-        .btn-primary, .btn-success { background-color: #198754; border-color: #198754; }
-        .btn-primary:hover, .btn-success:hover { background-color: #157347; border-color: #146c43; } /* Darker Green */
+        .navbar-toggler { border-color: white; }
+        .navbar-toggler-icon { background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3e%3cpath stroke='white' stroke-linecap='round' stroke-miterlimit='10' stroke-width='2' d='M4 7h22M4 15h22M4 23h22'/%3e%3c/svg%3e"); }
+        .card { border: 2px solid #ff6b00; border-radius: 15px; box-shadow: 0 4px 8px rgba(255, 107, 0, 0.1); }
+        .card-title { color: #ff6b00; font-weight: bold; }
+        .card-body { background-color: #fffaf0; }
+        .btn-primary, .btn-success { 
+            background-color: #ff6b00; 
+            border-color: #ff6b00; 
+            color: white;
+            font-weight: bold;
+        }
+        .btn-primary:hover, .btn-success:hover { 
+            background-color: #e55a00; 
+            border-color: #e55a00; 
+        }
+        .btn-secondary { 
+            background-color: #6c757d; 
+            border-color: #6c757d; 
+        }
+        .btn-danger { 
+            background-color: #dc3545; 
+            border-color: #dc3545; 
+        }
+        .carousel-caption { 
+            background-color: rgba(255, 107, 0, 0.8); 
+            border-radius: 10px;
+        }
+        .list-group-item { 
+            border-left: 3px solid #ff6b00; 
+            margin-bottom: 5px;
+        }
         .notification {
             position: fixed;
             top: 80px;
             right: 20px;
-            background-color: #28a745;
+            background-color: #ff6b00;
             color: white;
             padding: 15px;
             border-radius: 5px;
@@ -99,6 +126,31 @@ BASE_TEMPLATE = """
             display: none;
             box-shadow: 0 4px 8px rgba(0,0,0,0.2);
         }
+        .cart-badge {
+            background-color: white;
+            color: #ff6b00;
+            border-radius: 50%;
+            padding: 2px 6px;
+            font-size: 0.75rem;
+            margin-left: 4px;
+            font-weight: bold;
+        }
+        .form-control:focus {
+            border-color: #ff6b00;
+            box-shadow: 0 0 0 0.2rem rgba(255, 107, 0, 0.25);
+        }
+        .alert-success {
+            background-color: #d4edda;
+            border-color: #c3e6cb;
+            color: #155724;
+        }
+        .alert-danger {
+            background-color: #f8d7da;
+            border-color: #f5c6cb;
+            color: #721c24;
+        }
+        .text-orange { color: #ff6b00 !important; }
+        .bg-orange { background-color: #ff6b00 !important; }
     </style>
     {% block head_extra %}{% endblock %}
 </head>
@@ -109,18 +161,36 @@ BASE_TEMPLATE = """
                 {% if settings.logo_url %}
                     <img src="{{ settings.logo_url }}" alt="Foodify Logo" style="height: 40px;">
                 {% else %}
-                    FOODIFY 🍴
+                    FOODIFY 🍊
                 {% endif %}
             </a>
+
+            <!-- Cart link visible on mobile outside the menu -->
+            <a class="nav-link d-lg-none me-3 position-relative" href="{{ url_for('cart_page') }}">
+                Cart 
+                {% if session.get('cart') %}
+                <span class="position-absolute top-0 start-100 translate-middle cart-badge">
+                    {{ session.get('cart')|length }}
+                </span>
+                {% endif %}
+            </a>
+
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
                 <span class="navbar-toggler-icon"></span>
             </button>
+
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav ms-auto">
                     <li class="nav-item"><a class="nav-link" href="{{ url_for('index') }}">Home</a></li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('cart_page') }}">
-                            Cart <span class="badge bg-light text-dark">{{ session.get('cart')|length if session.get('cart') else 0 }}</span>
+                    <!-- Cart link hidden on mobile (already shown above) -->
+                    <li class="nav-item d-none d-lg-block">
+                        <a class="nav-link position-relative" href="{{ url_for('cart_page') }}">
+                            Cart
+                            {% if session.get('cart') %}
+                            <span class="position-absolute top-0 start-100 translate-middle cart-badge">
+                                {{ session.get('cart')|length }}
+                            </span>
+                            {% endif %}
                         </a>
                     </li>
                     <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_login') }}">Admin</a></li>
@@ -156,7 +226,7 @@ HOME_TEMPLATE = """
             {% for food in foods %}
             <div class="carousel-item {{ 'active' if loop.first }}">
                 <img src="{{ food.image_url }}" class="d-block w-100" alt="{{ food.name }}" style="object-fit: cover; height: 400px;">
-                <div class="carousel-caption d-none d-md-block bg-dark bg-opacity-50 p-2 rounded">
+                <div class="carousel-caption d-none d-md-block p-2 rounded">
                     <h5>{{ food.name }}</h5>
                     <p>Only Rs {{ "%.2f"|format(food.price) }}</p>
                 </div>
@@ -174,14 +244,14 @@ HOME_TEMPLATE = """
     </div>
     {% endif %}
     <div class="text-center mb-4">
-        <h1>Welcome to FOODIFY</h1>
+        <h1 class="text-orange">Welcome to FOODIFY</h1>
         <p class="lead">The best food, delivered right to your door.</p>
     </div>
     <div class="row">
         {% for food in foods %}
         <div class="col-md-4 mb-4">
             <div class="card h-100">
-                <img src="{{ food.image_url }}" class="card-img-top" alt="{{ food.name }}" style="height: 200px; object-fit: cover;">
+                <img src="{{ food.image_url }}" class="card-img-top" alt="{{ food.name }}" style="height: 200px; object-fit: cover; border-top-left-radius: 13px; border-top-right-radius: 13px;">
                 <div class="card-body d-flex flex-column">
                     <h5 class="card-title">{{ food.name }}</h5>
                     <p class="card-text">Price: Rs {{ "%.2f"|format(food.price) }}</p>
@@ -206,7 +276,7 @@ CART_TEMPLATE = """
 {% extends "base.html" %}
 {% block title %}Your Cart - FOODIFY{% endblock %}
 {% block content %}
-<h1 class="text-center mb-4">Your Cart & Checkout</h1>
+<h1 class="text-center mb-4 text-orange">Your Cart & Checkout</h1>
 {% if error %}
     <div class="alert alert-danger">{{ error }}</div>
 {% endif %}
@@ -214,7 +284,7 @@ CART_TEMPLATE = """
     <div class="row">
         <!-- Cart Items -->
         <div class="col-md-6">
-            <h2>Order Summary</h2>
+            <h2 class="text-orange">Order Summary</h2>
             {% if cart_items %}
                 <ul class="list-group mb-3">
                     {% for item in cart_items %}
@@ -235,11 +305,11 @@ CART_TEMPLATE = """
                         <span>Rs {{ "%.2f"|format(delivery_charge) }}</span>
                     </li>
                     <li class="list-group-item d-flex justify-content-between bg-light">
-                        <span class="fw-bold">Total (INR)</span>
-                        <strong class="fw-bold">Rs {{ "%.2f"|format(total_bill) }}</strong>
+                        <span class="fw-bold text-orange">Total (INR)</span>
+                        <strong class="fw-bold text-orange">Rs {{ "%.2f"|format(total_bill) }}</strong>
                     </li>
                 </ul>
-                <a href="{{ url_for('clear_cart') }}" class="btn btn-sm btn-danger">Clear Cart</a>
+                <a href="{{ url_for('clear_cart') }}" class="btn btn-danger">Clear Cart</a>
             {% else %}
                 <p>Your cart is empty.</p>
                 <a href="{{ url_for('index') }}" class="btn btn-primary">Continue Shopping</a>
@@ -248,7 +318,7 @@ CART_TEMPLATE = """
         <!-- Customer Details -->
         {% if cart_items %}
         <div class="col-md-6">
-            <h2>Delivery Details</h2>
+            <h2 class="text-orange">Delivery Details</h2>
             <div class="mb-3">
                 <label for="customer_name" class="form-label">Full Name</label>
                 <input type="text" class="form-control" id="customer_name" name="customer_name" required>
@@ -320,10 +390,10 @@ ORDER_SUCCESS_TEMPLATE = """
 {% block title %}Order Confirmed - FOODIFY{% endblock %}
 {% block content %}
 <div class="text-center">
-    <h1 class="text-success">✅ Order Placed Successfully!</h1>
+    <h1 class="text-orange">✅ Order Placed Successfully!</h1>
     <p class="lead">Thank you for your order, {{ order.customer_name }}.</p>
     <div class="card w-75 mx-auto my-4">
-        <div class="card-header">
+        <div class="card-header bg-orange text-white">
             Order Summary (ID: #{{ order.id }})
         </div>
         <div class="card-body text-start">
@@ -331,14 +401,14 @@ ORDER_SUCCESS_TEMPLATE = """
             <p><strong>Phone:</strong> {{ order.customer_phone }}</p>
             <p><strong>Address:</strong> {{ order.customer_address }}</p>
             <hr>
-            <h6>Items:</h6>
+            <h6 class="text-orange">Items:</h6>
             <ul>
             {% for item in order.items %}
                 <li>{{ item.food_name }} x {{ item.quantity }} - Rs {{ "%.2f"|format(item.price * item.quantity) }}</li>
             {% endfor %}
             </ul>
             <hr>
-            <h5 class="text-end">Total Bill: Rs {{ "%.2f"|format(order.total_bill) }}</h5>
+            <h5 class="text-end text-orange">Total Bill: Rs {{ "%.2f"|format(order.total_bill) }}</h5>
         </div>
     </div>
     <a href="{{ url_for('index') }}" class="btn btn-primary">Back to Home</a>
@@ -353,7 +423,7 @@ ADMIN_LOGIN_TEMPLATE = """
 {% block content %}
 <div class="row justify-content-center">
     <div class="col-md-6">
-        <h1 class="text-center">Admin Login</h1>
+        <h1 class="text-center text-orange">Admin Login</h1>
         {% if error %}
             <div class="alert alert-danger">{{ error }}</div>
         {% endif %}
@@ -382,13 +452,13 @@ ADMIN_DASHBOARD_TEMPLATE = """
 {% endblock %}
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-4">
-    <h1>Admin Dashboard</h1>
+    <h1 class="text-orange">Admin Dashboard</h1>
     <a href="{{ url_for('admin_logout') }}" class="btn btn-danger">Logout</a>
 </div>
 
 <!-- Site Settings Section -->
 <div class="card mb-4">
-    <div class="card-header">
+    <div class="card-header bg-orange text-white">
         <h5>Site Settings</h5>
     </div>
     <div class="card-body">
@@ -422,10 +492,10 @@ ADMIN_DASHBOARD_TEMPLATE = """
 <div class="row">
     <!-- Manage Foods Section -->
     <div class="col-md-5">
-        <h2>Manage Foods</h2>
+        <h2 class="text-orange">Manage Foods</h2>
         <div class="card">
             <div class="card-body">
-                <h5 class="card-title">Add/Edit Food</h5>
+                <h5 class="card-title text-orange">Add/Edit Food</h5>
                 <form action="{{ url_for('admin_add_edit_food') }}" method="post" enctype="multipart/form-data">
                     <input type="hidden" name="food_id" id="food_id">
                     <div class="mb-3">
@@ -446,7 +516,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
                 </form>
             </div>
         </div>
-        <h3 class="mt-4">Existing Foods</h3>
+        <h3 class="mt-4 text-orange">Existing Foods</h3>
         <ul class="list-group">
             {% for food in foods %}
             <li class="list-group-item d-flex justify-content-between align-items-center">
@@ -462,7 +532,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
 
     <!-- View Orders Section -->
     <div class="col-md-7">
-        <h2>Customer Orders</h2>
+        <h2 class="text-orange">Customer Orders</h2>
         <div id="orders-list">
             {% include 'admin_orders_partial.html' %}
         </div>
@@ -515,14 +585,14 @@ ADMIN_DASHBOARD_TEMPLATE = """
 ADMIN_ORDERS_PARTIAL = """
 {% for order in orders %}
 <div class="card mb-3">
-    <div class="card-header d-flex justify-content-between">
+    <div class="card-header bg-orange text-white d-flex justify-content-between">
         <strong>Order #{{ order.id }}</strong>
         <span>{{ order.timestamp.strftime('%Y-%m-%d %H:%M') }}</span>
     </div>
     <div class="card-body">
         <p><strong>Customer:</strong> {{ order.customer_name }} ({{ order.customer_phone }})</p>
         <p><strong>Address:</strong> {{ order.customer_address }}</p>
-        <h6>Items:</h6>
+        <h6 class="text-orange">Items:</h6>
         <ul>
         {% for item in order.items %}
             <li>{{ item.food_name }} x {{ item.quantity }}</li>
@@ -530,7 +600,7 @@ ADMIN_ORDERS_PARTIAL = """
         </ul>
         <hr>
         <div class="d-flex justify-content-between align-items-center">
-            <h5 class="m-0">Total: Rs {{ "%.2f"|format(order.total_bill) }}</h5>
+            <h5 class="m-0 text-orange">Total: Rs {{ "%.2f"|format(order.total_bill) }}</h5>
             <div>
                 <a href="https://www.google.com/maps/search/?api=1&query={{ order.customer_address|urlencode }}" target="_blank" class="btn btn-info">View on Map</a>
                 <a href="{{ url_for('download_bill', order_id=order.id) }}" class="btn btn-primary">Download Bill</a>
