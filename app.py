@@ -9,7 +9,7 @@ from jinja2 import DictLoader
 from datetime import datetime
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from io import BytesIO
 
@@ -18,6 +18,7 @@ from io import BytesIO
 # ==============================================================================
 
 UPLOAD_FOLDER = 'uploads'
+DELIVERY_CHARGE = 20.0
 app = Flask(__name__)
 
 # Use environment variables for configuration
@@ -226,8 +227,16 @@ CART_TEMPLATE = """
                     </li>
                     {% endfor %}
                     <li class="list-group-item d-flex justify-content-between">
-                        <span>Total (INR)</span>
-                        <strong>Rs {{ "%.2f"|format(total_bill) }}</strong>
+                        <span>Subtotal</span>
+                        <span>Rs {{ "%.2f"|format(subtotal) }}</span>
+                    </li>
+                    <li class="list-group-item d-flex justify-content-between">
+                        <span>Delivery Charge</span>
+                        <span>Rs {{ "%.2f"|format(delivery_charge) }}</span>
+                    </li>
+                    <li class="list-group-item d-flex justify-content-between bg-light">
+                        <span class="fw-bold">Total (INR)</span>
+                        <strong class="fw-bold">Rs {{ "%.2f"|format(total_bill) }}</strong>
                     </li>
                 </ul>
                 <a href="{{ url_for('clear_cart') }}" class="btn btn-sm btn-danger">Clear Cart</a>
@@ -603,16 +612,23 @@ def add_to_cart(food_id):
 def cart_page():
     cart = session.get('cart', {})
     cart_items = []
-    total_bill = 0
+    subtotal = 0
     
     for food_id, quantity in cart.items():
-        food = Food.query.get(food_id)
+        food = db.session.get(Food, food_id)
         if food:
-            subtotal = food.price * quantity
-            cart_items.append({'food': food, 'quantity': quantity, 'subtotal': subtotal})
-            total_bill += subtotal
+            item_subtotal = food.price * quantity
+            cart_items.append({'food': food, 'quantity': quantity, 'subtotal': item_subtotal})
+            subtotal += item_subtotal
+    
+    delivery_charge = 0
+    if cart_items: # Only add delivery charge if there are items in the cart
+        delivery_charge = DELIVERY_CHARGE
+    
+    total_bill = subtotal + delivery_charge
             
-    return render('order.html', cart_items=cart_items, total_bill=total_bill, error=request.args.get('error'))
+    return render('order.html', cart_items=cart_items, subtotal=subtotal, 
+                  delivery_charge=delivery_charge, total_bill=total_bill, error=request.args.get('error'))
 
 @app.route('/cart/clear')
 def clear_cart():
@@ -640,13 +656,13 @@ def place_order():
     if not cart:
         return redirect(url_for('cart_page'))
 
-    total_bill = 0
+    subtotal = 0
     order_items = []
     
     for food_id, quantity in cart.items():
-        food = Food.query.get(food_id)
+        food = db.session.get(Food, food_id)
         if food and quantity > 0:
-            total_bill += food.price * quantity
+            subtotal += food.price * quantity
             order_items.append(OrderItem(
                 food_name=food.name,
                 quantity=quantity,
@@ -655,6 +671,8 @@ def place_order():
 
     if not order_items:
         return redirect(url_for('cart_page'))
+
+    total_bill = subtotal + DELIVERY_CHARGE
 
     # Create new order
     new_order = Order(
@@ -673,11 +691,10 @@ def place_order():
 
 @app.route('/order/success/<int:order_id>')
 def order_success(order_id):
-    order = Order.query.get_or_404(order_id)
+    order = db.get_or_404(Order, order_id)
     return render('order_success.html', order=order)
 
 # --- Admin Routes ---
-
 @app.route('/admin', methods=['GET', 'POST'])
 def admin_login():
     if 'admin_logged_in' in session:
@@ -728,7 +745,7 @@ def admin_add_edit_food():
         image_file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
 
     if food_id: # Edit existing food
-        food = Food.query.get(food_id)
+        food = db.session.get(Food, food_id)
         food.name = name
         food.price = price
         if filename:
@@ -751,7 +768,7 @@ def admin_delete_food(food_id):
     if 'admin_logged_in' not in session:
         return redirect(url_for('admin_login'))
     
-    food = Food.query.get_or_404(food_id)
+    food = db.get_or_404(Food, food_id)
     db.session.delete(food)
     db.session.commit()
     return redirect(url_for('admin_dashboard'))
@@ -792,47 +809,79 @@ def download_bill(order_id):
     if 'admin_logged_in' not in session:
         return redirect(url_for('admin_login'))
 
-    order = Order.query.get_or_404(order_id)
+    order = db.get_or_404(Order, order_id)
     
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    
+    # Page size for a 58mm thermal printer (58mm ~ 164 points)
+    page_width = 164
+    # Set small margins
+    doc = SimpleDocTemplate(buffer, pagesize=(page_width, 800), leftMargin=5, rightMargin=5, topMargin=10, bottomMargin=10)
+    
     styles = getSampleStyleSheet()
+    # Custom smaller styles for receipt
+    styles.add(ParagraphStyle(name='Center', alignment=1, fontSize=10, leading=12))
+    styles.add(ParagraphStyle(name='NormalSmall', fontSize=8, leading=10))
+    styles.add(ParagraphStyle(name='ItemStyle', fontSize=8, leading=10, wordWrap='CJK'))
+    styles.add(ParagraphStyle(name='TotalStyle', alignment=2, fontSize=9, fontName='Helvetica-Bold', leading=12))
     
     elements = []
     
-    # Title
-    elements.append(Paragraph("FOODIFY Invoice", styles['h1']))
-    elements.append(Spacer(1, 12))
+    # --- Receipt Header ---
+    elements.append(Paragraph("FOODIFY", styles['Center']))
+    elements.append(Paragraph("Thank you for your order!", styles['Center']))
+    elements.append(Paragraph("---------------------------------", styles['Center']))
     
-    # Order Details
-    elements.append(Paragraph(f"<b>Order ID:</b> #{order.id}", styles['Normal']))
-    elements.append(Paragraph(f"<b>Date:</b> {order.timestamp.strftime('%Y-%m-%d %H:%M')}", styles['Normal']))
-    elements.append(Paragraph(f"<b>Customer:</b> {order.customer_name}", styles['Normal']))
-    elements.append(Paragraph(f"<b>Phone:</b> {order.customer_phone}", styles['Normal']))
-    elements.append(Paragraph(f"<b>Address:</b> {order.customer_address}", styles['Normal']))
-    elements.append(Spacer(1, 24))
+    # --- Order Details ---
+    elements.append(Paragraph(f"Order: #{order.id}", styles['NormalSmall']))
+    elements.append(Paragraph(f"Date: {order.timestamp.strftime('%d-%m-%y %H:%M')}", styles['NormalSmall']))
+    elements.append(Paragraph(f"Name: {order.customer_name}", styles['NormalSmall']))
+    elements.append(Paragraph("---------------------------------", styles['Center']))
 
-    # Items Table
-    data = [['Item', 'Quantity', 'Unit Price', 'Total']]
+    # --- Items Table (simplified for narrow format) ---
+    data = []
     for item in order.items:
-        data.append([item.food_name, item.quantity, f"Rs {item.price:.2f}", f"Rs {item.price * item.quantity:.2f}"])
-    
-    data.append(['', '', '<b>Total Bill</b>', f"<b>Rs {order.total_bill:.2f}</b>"])
-    
-    table = Table(data, colWidths=[200, 80, 80, 80])
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1AD145")),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -2), colors.beige),
-        ('GRID', (0, 0), (-1, -2), 1, colors.black),
-        ('ALIGN', (0, -1), (-1, -1), 'RIGHT'),
-        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
-        ('TOPPADDING', (0, -1), (-1, -1), 12),
+        # Item name on one line
+        data.append([Paragraph(item.food_name, styles['ItemStyle']), ''])
+        # Quantity, price, and subtotal on the next line, right-aligned
+        price_details = f"{item.quantity} x Rs {item.price:.2f} = Rs {item.price * item.quantity:.2f}"
+        data.append(['', Paragraph(price_details, styles['TotalStyle'])])
+
+    # Create the table for items
+    item_table = Table(data, colWidths=[100, 54])
+    item_table.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
     ]))
-    elements.append(table)
+    elements.append(item_table)
+
+    # --- Subtotal and Delivery Charge ---
+    subtotal = order.total_bill - DELIVERY_CHARGE
+    summary_data = [
+        [Paragraph(f"Subtotal:", styles['NormalSmall']), Paragraph(f"Rs {subtotal:.2f}", styles['TotalStyle'])],
+        [Paragraph(f"Delivery Charge:", styles['NormalSmall']), Paragraph(f"Rs {DELIVERY_CHARGE:.2f}", styles['TotalStyle'])]
+    ]
+    summary_table = Table(summary_data, colWidths=[80, 74])
+    elements.append(summary_table)
+
+    # --- Footer ---
+    elements.append(Paragraph("---------------------------------", styles['Center']))
+    
+    # Total Bill
+    # Wrap the content in Paragraph objects to correctly render the <b> tags
+    total_data = [[
+        Paragraph('<b>Total Bill:</b>', styles['NormalSmall']),
+        Paragraph(f"<b>Rs {order.total_bill:.2f}</b>", styles['TotalStyle'])
+    ]]
+    total_table = Table(total_data, colWidths=[80, 74])
+    total_table.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    elements.append(total_table)
+    elements.append(Spacer(1, 12))
+    elements.append(Paragraph("Visit Again!", styles['Center']))
     
     doc.build(elements)
     
