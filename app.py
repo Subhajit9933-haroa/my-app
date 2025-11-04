@@ -968,19 +968,10 @@ def setup_database(app):
         if not os.path.exists(UPLOAD_FOLDER):
             os.makedirs(UPLOAD_FOLDER)
         db.create_all()
-        # Add some initial food items if the database is empty.
-        # This is good for first-time setup.
-        if Food.query.count() == 0:
-            print("Database is empty. Seeding with initial food items...")
-            foods = [
-                Food(name='Classic Burger', price=8.99, image_url='https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&w=500'),
-                Food(name='Margherita Pizza', price=12.50, image_url='https://images.unsplash.com/photo-1598021680133-eb3a110d4c1c?auto=format&fit=crop&w=500'),
-                Food(name='Crispy Fries', price=4.00, image_url='https://images.unsplash.com/photo-1576107232684-c7e3e37b6929?auto=format&fit=crop&w=500'),
-                Food(name='Caesar Salad', price=9.25, image_url='https://images.unsplash.com/photo-1550304943-4f24f54ddde9?auto=format&fit=crop&w=500')
-            ]
-            db.session.bulk_save_objects(foods)
-            db.session.commit()
-        print("Database initialized and sample data checked.")
+        # Remove the initial food items seeding
+        # Admin can add food items through the admin panel
+        print("Database initialized. No initial food items added.")
+        print("Please login to admin panel to add food items.")
 
 def get_local_ip():
     """Function to get the local IP address of the machine."""
