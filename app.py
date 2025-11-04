@@ -265,7 +265,7 @@ HOME_TEMPLATE = """
             </div>
         </div>
         {% else %}
-        <p>No food items available at the moment. Please check back later.</p>
+        <p>OUR DELIVERY SERVICE TIME 6:00PM TO 10:00PM.</p>
         {% endfor %}
     </div>
 {% endblock %}
@@ -998,3 +998,4 @@ def init_db_command():
     """Creates the database tables and seeds initial data."""
     setup_database(app)
     print("Database initialized.")
+
